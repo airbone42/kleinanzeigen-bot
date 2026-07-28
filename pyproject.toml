@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kleinanzeigen-telegram-bot"
+version = "0.1.0"
+description = "Intelligent Telegram bot for automated Kleinanzeigen listing management"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Tobias Zander", email = "info@tobiaszander.de" }]
+dependencies = [
+    "python-telegram-bot[job-queue]>=20.7",
+    "langgraph>=0.2.0",
+    "langchain-openai>=0.1.0",
+    "langchain-core>=0.2.0",
+    "apscheduler>=3.10.0,<4.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "aiosqlite>=0.19.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.26.0",
+    "pyyaml>=6.0.1",
+    # Pinned to a fixed commit for reproducible builds (was a moving @main ref).
+    "kleinanzeigen-bot @ git+https://github.com/Second-Hand-Friends/kleinanzeigen-bot.git@c65d1b6",
+    "playwright>=1.40.0",
+    "discogs-client>=2.3.0",
+]
+
+[project.urls]
+Homepage = "https://www.tobiaszander.de"
+Repository = "https://github.com/airbone42/kleinanzeigen-bot"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+    "mypy>=1.8.0",
+    "ruff>=0.2.0",
+    "langgraph-cli[inmem]>=0.1.0",
+    "langgraph-sdk>=0.1.0",
+]
+
+[project.scripts]
+kleinanzeigen-bot-telegram = "bot.main:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bot", "agents", "config", "db", "models", "services"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true

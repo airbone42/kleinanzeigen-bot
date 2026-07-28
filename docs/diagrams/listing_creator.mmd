@@ -1,0 +1,14 @@
+flowchart TD
+    START([START]) --> analyze_images[analyze_images]
+
+    analyze_images --> generate_title[generate_title]
+    analyze_images --> generate_category[generate_category]
+    analyze_images --> estimate_price[estimate_price]
+    generate_title --> generate_description[generate_description]
+
+    generate_description --> join_all{{wait_all}}
+    generate_category --> join_all
+    estimate_price --> join_all
+    join_all --> finalize_listing[finalize_listing]
+
+    finalize_listing --> END([END])

@@ -1,0 +1,49 @@
+# Environment variables
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / tooling
+.idea/
+.vscode/
+*.swp
+*.swo
+.claude/
+
+# Database
+data/
+*.db
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# kleinanzeigen-bot config + runtime artifacts (credentials, caches, rotated logs,
+# browser profile, downloaded ads). Ignore everything under kleinanzeigen-config
+# except the committed example template.
+kleinanzeigen-config/*
+!kleinanzeigen-config/config.example.yaml
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/

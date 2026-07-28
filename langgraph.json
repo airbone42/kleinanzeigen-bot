@@ -1,0 +1,10 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "listing_creator": "./agents/listing_creator.py:listing_creator_graph",
+    "listing_optimizer": "./agents/listing_optimizer.py:listing_optimizer_graph",
+    "discogs_sync": "./agents/discogs_sync.py:discogs_sync_graph"
+  },
+  "env": ".env",
+  "python_version": "3.11"
+}

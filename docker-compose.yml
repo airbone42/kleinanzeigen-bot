@@ -1,0 +1,18 @@
+services:
+  bot:
+    build: .
+    container_name: kleinanzeigen-bot
+    restart: unless-stopped
+    network_mode: host
+    shm_size: '256m'
+    env_file: .env
+    volumes:
+      - ./kleinanzeigen-config:/app/kleinanzeigen-config
+      - ./data:/app/data
+      - ./bot:/app/bot
+      - ./agents:/app/agents
+      - ./services:/app/services
+      - ./models:/app/models
+      - ./db:/app/db
+      - ./config:/app/config
+      - ./tests:/app/tests

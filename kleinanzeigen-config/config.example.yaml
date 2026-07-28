@@ -1,0 +1,22 @@
+# Example configuration for kleinanzeigen-bot.
+#
+# Copy this file to `config.yaml` in the same directory and fill in your real
+# values. `config.yaml` holds credentials and is gitignored — never commit it.
+#
+# See https://github.com/Second-Hand-Friends/kleinanzeigen-bot for the full schema.
+
+login:
+  username: "your-email@example.com"   # Your kleinanzeigen.de login email
+  password: "your-password"            # Your kleinanzeigen.de password
+
+# Default contact details applied to every ad. `zipcode` is required.
+ad_defaults:
+  contact:
+    name: "Your Name"
+    zipcode: "12345"
+
+# Browser settings are managed automatically by the bot on startup (it writes the
+# Playwright Chromium binary path, headless flags and user_data_dir here). You
+# normally do not need to set anything under `browser:` manually.
+browser:
+  use_private_window: false

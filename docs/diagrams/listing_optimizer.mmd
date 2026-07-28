@@ -1,0 +1,8 @@
+flowchart TD
+    START([START]) --> check_price[check_price]
+
+    check_price -->|optimize| optimize_listing[optimize_listing]
+    check_price -->|suggest_delete| suggest_delete[suggest_delete]
+
+    optimize_listing --> END([END])
+    suggest_delete --> END

@@ -1,0 +1,9 @@
+.venv/
+.git/
+data/
+.env
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+kleinanzeigen-config/
+scripts/
