@@ -8,6 +8,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from models.state import ListingCreatorState
+from services.categories import CATEGORY_LIST as _CATEGORY_LIST, DEFAULT_CATEGORY as _DEFAULT_CATEGORY
 from services.openrouter import get_text_llm, get_feedback_llm
 
 logger = logging.getLogger(__name__)
@@ -257,39 +258,12 @@ async def generate_description(state: ListingCreatorState) -> dict[str, Any]:
         return {"description": "Gut erhaltener Artikel abzugeben. Besichtigung möglich."}
 
 
-_CATEGORY_LIST = [
-    'Elektronik > Smartphones',
-    'Elektronik > Tablets & eBook-Reader',
-    'Elektronik > Computer & Zubehör',
-    'Elektronik > TV, Video & Audio',
-    'Elektronik > Foto & Zubehör',
-    'Elektronik > Spielkonsolen & Games',
-    'Elektronik > Sonstiges',
-    'Haus & Garten > Möbel & Einrichtung',
-    'Haus & Garten > Haushaltsgeräte',
-    'Haus & Garten > Heimwerken & Bau',
-    'Haus & Garten > Küche & Kochen',
-    'Haus & Garten > Sonstiges',
-    'Mode & Beauty > Damen',
-    'Mode & Beauty > Herren',
-    'Mode & Beauty > Schuhe',
-    'Mode & Beauty > Taschen & Accessoires',
-    'Mode & Beauty > Sonstiges',
-    'Familie, Kind & Baby > Spielzeug',
-    'Familie, Kind & Baby > Kinderbekleidung & Schuhe',
-    'Familie, Kind & Baby > Sonstiges',
-    'Musik, Filme & Bücher > Bücher',
-    'Musik, Filme & Bücher > Musik',
-    'Musik, Filme & Bücher > Filme & DVDs & Blu-ray',
-    'Freizeit, Hobby & Nachbarschaft > Sport & Camping',
-    'Freizeit, Hobby & Nachbarschaft > Fahrräder & Zubehör',
-    'Freizeit, Hobby & Nachbarschaft > Sonstiges',
-    'Auto, Rad & Boot > Autozubehör & Teile',
-]
-
-_DEFAULT_CATEGORY = 'Freizeit, Hobby & Nachbarschaft > Sonstiges'
-
-CATEGORY_SYSTEM_PROMPT = 'Du bist ein Experte für Kleinanzeigen-Kategorien.\nWähle die passendste Kategorie für diesen Artikel aus der folgenden Liste.\nAntworte NUR mit dem exakten Kategorienamen aus der Liste, ohne weitere Erklärung.\n\nVerfügbare Kategorien:\nElektronik > Smartphones\nElektronik > Tablets & eBook-Reader\nElektronik > Computer & Zubehör\nElektronik > TV, Video & Audio\nElektronik > Foto & Zubehör\nElektronik > Spielkonsolen & Games\nElektronik > Sonstiges\nHaus & Garten > Möbel & Einrichtung\nHaus & Garten > Haushaltsgeräte\nHaus & Garten > Heimwerken & Bau\nHaus & Garten > Küche & Kochen\nHaus & Garten > Sonstiges\nMode & Beauty > Damen\nMode & Beauty > Herren\nMode & Beauty > Schuhe\nMode & Beauty > Taschen & Accessoires\nMode & Beauty > Sonstiges\nFamilie, Kind & Baby > Spielzeug\nFamilie, Kind & Baby > Kinderbekleidung & Schuhe\nFamilie, Kind & Baby > Sonstiges\nMusik, Filme & Bücher > Bücher\nMusik, Filme & Bücher > Musik\nMusik, Filme & Bücher > Filme & DVDs & Blu-ray\nFreizeit, Hobby & Nachbarschaft > Sport & Camping\nFreizeit, Hobby & Nachbarschaft > Fahrräder & Zubehör\nFreizeit, Hobby & Nachbarschaft > Sonstiges\nAuto, Rad & Boot > Autozubehör & Teile'
+CATEGORY_SYSTEM_PROMPT = (
+    'Du bist ein Experte für Kleinanzeigen-Kategorien.\n'
+    'Wähle die passendste Kategorie für diesen Artikel aus der folgenden Liste.\n'
+    'Antworte NUR mit dem exakten Kategorienamen aus der Liste, ohne weitere Erklärung.\n\n'
+    'Verfügbare Kategorien:\n' + '\n'.join(_CATEGORY_LIST)
+)
 
 
 async def generate_category(state: ListingCreatorState) -> dict[str, Any]:

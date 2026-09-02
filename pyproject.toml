@@ -23,7 +23,7 @@ dependencies = [
     "httpx>=0.26.0",
     "pyyaml>=6.0.1",
     # Pinned to a fixed commit for reproducible builds (was a moving @main ref).
-    "kleinanzeigen-bot @ git+https://github.com/Second-Hand-Friends/kleinanzeigen-bot.git@c65d1b6",
+    "kleinanzeigen-bot @ git+https://github.com/Second-Hand-Friends/kleinanzeigen-bot.git@9870c0a",
     "playwright>=1.40.0",
     "discogs-client>=2.3.0",
 ]

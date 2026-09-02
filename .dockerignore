@@ -6,4 +6,5 @@ data/
 **/*.pyc
 .pytest_cache/
 kleinanzeigen-config/
-scripts/
+scripts/*
+!scripts/fix_nodriver.py

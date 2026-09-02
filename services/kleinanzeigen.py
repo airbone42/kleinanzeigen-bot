@@ -49,12 +49,13 @@ from agents.nodes.text_generation import _CATEGORY_LIST
 from config.settings import settings
 from models.draft import Draft
 from models.listing import Listing
+from services.categories import DEFAULT_CATEGORY as _DEFAULT_CATEGORY, canonical_category
 from services.openrouter import get_text_llm
 
 logger = logging.getLogger(__name__)
 
-# Default category if none specified – must be a Parent > Child path that supports Sofort kaufen
-DEFAULT_CATEGORY = "Freizeit, Hobby & Nachbarschaft > Sonstiges"
+# Default category if none specified – must be resolvable by the bot's categories.yaml
+DEFAULT_CATEGORY = _DEFAULT_CATEGORY
 # Default republication interval in days
 DEFAULT_REPUBLICATION_INTERVAL = 60
 # Ads subdirectory within the config path
@@ -67,6 +68,60 @@ CONFIG_FILE_NAME = "config.yaml"
 DOWNLOAD_SINGLE_TIMEOUT = 300
 # Timeout for publish --ads new (seconds)
 PUBLISH_NEW_TIMEOUT = 900
+# Environment/setup warnings the bot emits regardless of the actual failure.
+BOT_NOISE_WARNING_RE = re.compile(r"nodriver CDP re-attach patch not found")
+
+# Retry behaviour for the published-ads API (in-page fetch fails sporadically)
+PUBLISHED_ADS_FETCH_ATTEMPTS = 3
+PUBLISHED_ADS_RETRY_DELAY = 3
+PUBLISHED_ADS_MAX_PAGES = 100
+
+
+def _coerce_page_number(raw: object) -> Optional[int]:
+    """Coerce a paging value from the API into a positive page number."""
+    try:
+        page = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return page if page > 0 else None
+
+
+def _coerce_api_price(raw: object) -> float:
+    """Coerce the ``price`` field of the published-ads API into EUR as float.
+
+    The API returns numbers, formatted strings ("1.250 € VB", "15,00 €")
+    or nested dicts ({"amount": ..., "currencyCode": "EUR"}). Returns 0.0 when no
+    amount can be derived (e.g. "Zu verschenken" / "VB" without a value).
+    """
+    if raw is None:
+        return 0.0
+    if isinstance(raw, bool):
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, dict):
+        for key in ("amount", "value", "amountInEuro", "priceAmount", "price"):
+            if key in raw:
+                return _coerce_api_price(raw[key])
+        cents = raw.get("priceInEuroCent") or raw.get("amountInCent")
+        if isinstance(cents, (int, float)):
+            return float(cents) / 100.0
+        return 0.0
+    if isinstance(raw, str):
+        # "1.250 € VB" -> 1250.0 ; "15,00 €" -> 15.0
+        match = re.search(r"\d{1,3}(?:\.\d{3})+|\d+(?:,\d{1,2})?", raw)
+        if not match:
+            return 0.0
+        token = match.group(0)
+        if "." in token and "," not in token:
+            token = token.replace(".", "")
+        else:
+            token = token.replace(".", "").replace(",", ".")
+        try:
+            return float(token)
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 class KleinanzeigenError(Exception):
@@ -99,13 +154,12 @@ class KleinanzeigenService:
     def _get_cli_command(self) -> list[str]:
         """Get the kleinanzeigen-bot CLI invocation as an argv list.
 
+        Runs through services.kb_cli so the runtime patches in services.kb_patches
+        (redesigned ad-page shipping extraction) are active for every CLI call.
         Returned as a list (not a space-joined string) so a sys.executable path
         containing spaces is passed as a single argv token instead of being split.
         """
-        if shutil.which("kleinanzeigen-bot"):
-            return ["kleinanzeigen-bot"]
-        # Fallback: run as Python module
-        return [sys.executable, "-m", "kleinanzeigen_bot"]
+        return [sys.executable, "-m", "services.kb_cli"]
 
     def _clear_browser_locks(self) -> None:
         """Remove stale LevelDB/Chromium lock files left by crashed browser processes."""
@@ -159,11 +213,19 @@ class KleinanzeigenService:
         logger.info(f"Running CLI: {' '.join(cmd_parts)}")
 
         try:
+            # The CLI runs with cwd=config_path, so the app root must be on
+            # PYTHONPATH for `python -m services.kb_cli` to be importable.
+            env = dict(os.environ)
+            app_root = str(Path(__file__).resolve().parent.parent)
+            env["PYTHONPATH"] = (
+                app_root + os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else app_root
+            )
             proc = await asyncio.create_subprocess_exec(
                 *cmd_parts,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self.config_path),
+                env=env,
             )
             if timeout is None:
                 stdout_b, stderr_b = await proc.communicate()
@@ -228,7 +290,7 @@ class KleinanzeigenService:
         title = title[:50]  # Enforce max length
 
         # Category: use draft.category or default
-        category = draft.category if draft.category else DEFAULT_CATEGORY
+        category = canonical_category(draft.category)
 
         # Build image glob pattern
         images: list[str] = []
@@ -341,21 +403,112 @@ class KleinanzeigenService:
 
     async def _fetch_published_ads_raw(self) -> list[dict]:
         """Fetch published ads via kleinanzeigen-bot API (no overview pagination)."""
-        from kleinanzeigen_bot import KleinanzeigenBot
+        from kleinanzeigen_bot import runtime_config as _runtime_config
+        from kleinanzeigen_bot.app import KleinanzeigenBot
 
         bot = KleinanzeigenBot()
         bot.command = "download"
         bot.ads_selector = "all"
         bot._config_arg = str(self.config_file)
-        bot._resolve_workspace()
-        bot.configure_file_logging()
-        bot.load_config()
+        bot.config_file_path = str(self.config_file)
+        bot.workspace = _runtime_config.resolve_workspace(
+            command=bot.command,
+            config_file_path=bot.config_file_path,
+            config_arg=bot._config_arg,
+            logfile_arg=None,
+            workspace_mode=None,
+            logfile_explicitly_provided=False,
+            log_basename=bot._log_basename,
+        )
+        if bot.workspace is not None:
+            bot.config_file_path = str(bot.workspace.config_file)
+            bot.log_file_path = str(bot.workspace.log_file) if bot.workspace.log_file else None
+        bot._bootstrap_runtime()
         try:
             await bot.create_browser_session()
             await bot.login()
-            return await bot._fetch_published_ads()
+            return await self._fetch_published_ads_resilient(bot)
         finally:
-            bot.close_browser_session()
+            await bot.close_browser_session()
+
+    async def _fetch_published_ads_resilient(self, bot) -> list[dict]:
+        """Fetch published ads with retries and a navigation-based fallback.
+
+        The upstream fetch runs `fetch()` inside the logged-in page. That call
+        fails sporadically with "TypeError: Failed to fetch" (request aborted by a
+        concurrent navigation, or a cross-origin redirect that CORS blocks), which
+        aborted the whole check. Retry, then fall back to opening the JSON endpoint
+        as a normal navigation, which is immune to both causes.
+        """
+        from kleinanzeigen_bot import published_ads as _published_ads
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, PUBLISHED_ADS_FETCH_ATTEMPTS + 1):
+            try:
+                ads = await _published_ads.fetch_published_ads(bot, bot.root_url)
+                if ads:
+                    return ads
+                logger.warning(f"Published-ads fetch returned no ads (attempt {attempt})")
+            except Exception as e:
+                last_error = e
+                page_url = getattr(getattr(bot, "page", None), "url", "?")
+                logger.warning(
+                    f"Published-ads fetch failed (attempt {attempt}, page={page_url}): {e}"
+                )
+            if attempt < PUBLISHED_ADS_FETCH_ATTEMPTS:
+                await asyncio.sleep(PUBLISHED_ADS_RETRY_DELAY * attempt)
+                try:
+                    await bot.web_open(bot.root_url)
+                except Exception as e:
+                    logger.warning(f"Could not reopen {bot.root_url} before retry: {e}")
+
+        logger.info("Falling back to navigation-based published-ads fetch")
+        try:
+            return await self._fetch_published_ads_via_navigation(bot)
+        except Exception as e:
+            if last_error is not None:
+                raise KleinanzeigenError(
+                    f"Anzeigen-Übersicht konnte nicht geladen werden: {last_error}"
+                ) from e
+            raise
+
+    async def _fetch_published_ads_via_navigation(self, bot) -> list[dict]:
+        """Read the manage-ads JSON API by navigating to it instead of fetch()."""
+        import json
+
+        ads: list[dict] = []
+        page = 1
+        while page <= PUBLISHED_ADS_MAX_PAGES:
+            url = f"{bot.root_url}/m-meine-anzeigen-verwalten.json?sort=DEFAULT&pageNum={page}"
+            await bot.web_open(url)
+            raw = await bot.web_execute(
+                "document.body ? (document.body.innerText || document.body.textContent) : ''"
+            )
+            if not isinstance(raw, str) or not raw.strip():
+                logger.warning(f"Navigation fallback: empty body on page {page}")
+                break
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(f"Navigation fallback: non-JSON body on page {page}: {raw[:200]!r}")
+                break
+            if not isinstance(data, dict) or not isinstance(data.get("ads"), list):
+                logger.warning(f"Navigation fallback: unexpected payload on page {page}")
+                break
+            ads.extend(a for a in data["ads"] if isinstance(a, dict) and "id" in a and "state" in a)
+
+            paging = data.get("paging")
+            if not isinstance(paging, dict):
+                break
+            next_page = _coerce_page_number(paging.get("next"))
+            last_page = _coerce_page_number(paging.get("last"))
+            current = _coerce_page_number(paging.get("pageNum")) or page
+            if next_page is None or (last_page is not None and current >= last_page):
+                break
+            page = next_page
+
+        logger.info(f"Navigation fallback fetched {len(ads)} published ads")
+        return ads
 
     async def get_published_listings_summary(self) -> list[Listing]:
         """Return Listing summaries derived from the published ads API."""
@@ -385,11 +538,9 @@ class KleinanzeigenService:
                     created_at = datetime.strptime(creation_date, "%d.%m.%Y").replace(tzinfo=tz)
                 except ValueError:
                     created_at = None
-            price = ad.get("price") or 0
-            try:
-                price_val = float(price)
-            except (TypeError, ValueError):
-                price_val = 0.0
+            price_val = _coerce_api_price(ad.get("price"))
+            if price_val == 0.0 and ad.get("price"):
+                logger.debug(f"Unparsable API price for ad {ad_id}: {ad.get('price')!r}")
             # state=="paused" means reserved via Kleinanzeigen UI;
             # title prefix "Reserviert" covers manual title-based reservations
             ad_state = str(ad.get("state") or "active")
@@ -515,7 +666,16 @@ class KleinanzeigenService:
 
     @staticmethod
     def _sanitize_ad_yaml(data: dict) -> dict:
-        return {k: v for k, v in data.items() if k in KleinanzeigenService._ALLOWED_AD_FIELDS}
+        """Drop unsupported keys and canonicalize the category.
+
+        Downloaded ads carry the leaf category name only ("Bücher & Zeitschriften"),
+        which the bot cannot resolve: it then opens the category page with the raw
+        name, nothing gets selected and the shipping section never renders.
+        """
+        clean = {k: v for k, v in data.items() if k in KleinanzeigenService._ALLOWED_AD_FIELDS}
+        if "category" in clean:
+            clean["category"] = canonical_category(clean["category"])
+        return clean
 
     @staticmethod
     def _normalize_shipping(existing_options: list[str], price: float) -> list[str]:
@@ -537,11 +697,36 @@ class KleinanzeigenService:
         return options
 
     def _extract_bot_error(self, output: str) -> str:
-        """Extract the first ERROR/WARNING line from bot output for user-visible messages."""
-        for line in output.splitlines():
-            if re.search(r"\[ERROR\]|\[WARNING\]|All \d+ attempts failed|CaptchaEncountered", line):
-                return line.strip()
+        """Extract the most relevant error line from bot output for user-visible messages.
+
+        ERROR lines win over WARNING lines: the bot emits environment warnings
+        (e.g. the nodriver patch hint) long before the actual failure, and showing
+        those instead of the real cause makes the message useless.
+        """
+        lines = output.splitlines()
+        errors: list[str] = []
+        warnings: list[str] = []
+        for idx, line in enumerate(lines):
+            if re.search(r"\[ERROR\]|All \d+ attempts failed|CaptchaEncountered", line):
+                errors.append(self._with_error_details(lines, idx))
+            elif "[WARNING]" in line and not BOT_NOISE_WARNING_RE.search(line):
+                warnings.append(line.strip())
+        if errors:
+            return errors[-1]
+        if warnings:
+            return warnings[-1]
         return "Unbekannter Fehler (Details: /logs)"
+
+    @staticmethod
+    def _with_error_details(lines: list[str], idx: int) -> str:
+        """Append bullet detail lines (e.g. pydantic validation errors) to a log line."""
+        parts = [lines[idx].strip()]
+        for follow in lines[idx + 1:idx + 4]:
+            stripped = follow.strip()
+            if not stripped.startswith("- "):
+                break
+            parts.append(stripped)
+        return " ".join(parts)
 
     def _extract_listing_url(self, output: str) -> Optional[str]:
         """Extract Kleinanzeigen listing URL from CLI output."""
@@ -823,6 +1008,12 @@ class KleinanzeigenService:
             "description": ".",
             "category": DEFAULT_CATEGORY,
             "price": 0,
+            # Must be explicit: config.yaml's ad_defaults combine shipping_type
+            # PICKUP with sell_directly true, which trips the bot's
+            # "sell_directly requires shipping_type to be SHIPPING" validation
+            # and aborts the delete run before the browser even starts.
+            "shipping_type": "PICKUP",
+            "sell_directly": False,
             "contact": contact,
         }
         with open(temp_yaml, "w", encoding="utf-8") as f:
@@ -883,7 +1074,9 @@ class KleinanzeigenService:
         else:
             error_msg = (stderr + "\n" + stdout).strip()
             logger.error(f"CLI delete failed (rc={returncode}): {error_msg}")
-            raise KleinanzeigenError(f"Löschen fehlgeschlagen: {error_msg[-600:]}")
+            raise KleinanzeigenError(
+                f"Löschen fehlgeschlagen: {self._extract_bot_error(error_msg)}"
+            )
 
     async def publish_draft(self, listing_id: str) -> bool:
         """Publish a draft listing.
@@ -994,7 +1187,13 @@ class KleinanzeigenService:
         combined_output = stdout + stderr
 
         def _shipping_dialog_failed(output: str) -> bool:
-            return "Andere Versandmethoden" in output
+            """True when publishing died in the shipping step of the ad form.
+
+            Besides the 'Andere Versandmethoden' route the shipping section can
+            fail to render entirely (category-specific), which surfaces as a
+            timeout on the 'ad-shipping-options' element.
+            """
+            return "Andere Versandmethoden" in output or "ad-shipping-options" in output
 
         pickup_warning: Optional[str] = None
 
@@ -1023,7 +1222,7 @@ class KleinanzeigenService:
                     "Shipping dialog retry %d/3 for listing %s with category '%s'",
                     i + 1, listing_id, alt_cat,
                 )
-                data["category"] = alt_cat
+                data["category"] = canonical_category(alt_cat)
                 data.pop("special_attributes", None)
                 with open(new_yaml, "w", encoding="utf-8") as f:
                     yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
@@ -1270,7 +1469,7 @@ class KleinanzeigenService:
                 "type": "OFFER",
                 "title": (title or str(row["title"]))[:50],
                 "description": (description or str(row["description"] or ""))[:4000],
-                "category": str(row["category"] or DEFAULT_CATEGORY) or DEFAULT_CATEGORY,
+                "category": canonical_category(str(row["category"] or "")),
                 "price": int(round(ad_price)),
                 "price_type": "NEGOTIABLE",
                 "auto_price_reduction": {"enabled": False},

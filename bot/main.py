@@ -106,6 +106,13 @@ def _setup_browser() -> None:
         # Persist browser profile between restarts (uses setdefault so user can override in config.yaml)
         browser_cfg["user_data_dir"] = str(settings.kleinanzeigen_config_path.resolve() / "browser-profile")
 
+        # Page loads on kleinanzeigen.de take ~40s in this container (headless Chromium,
+        # cold cache); the upstream default page_load timeout of 15s makes login fail with
+        # "Page did not finish loading within 15.0 seconds." setdefault → user can override.
+        timeouts_cfg = cfg.setdefault("timeouts", {})
+        timeouts_cfg.setdefault("page_load", 90)
+        timeouts_cfg.setdefault("login_detection", 20)
+
         # Clear stale ad directories from previous sessions. Without this, any ad_*
         # dirs without an id field would be re-published by publish --ads new,
         # causing duplicate or wrong listings.

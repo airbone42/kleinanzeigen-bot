@@ -9,6 +9,7 @@ WORKDIR /app
 # Copy project metadata first so pip install is cached separately from source changes
 COPY pyproject.toml .
 COPY README.md .
+COPY LICENSE .
 COPY bot/ bot/
 COPY agents/ agents/
 COPY config/ config/
@@ -16,9 +17,12 @@ COPY db/ db/
 COPY models/ models/
 COPY services/ services/
 COPY tests/ tests/
+COPY scripts/ scripts/
 
 # Install Python dependencies incl. test tooling for in-container verification.
-RUN pip install --no-cache-dir -e .[test]
+# fix_nodriver.py is upstream's PDM post_install hook, which plain pip installs skip.
+# Without it every XPath lookup fails with CDP -32601 and publishing breaks.
+RUN pip install --no-cache-dir -e .[test] && python scripts/fix_nodriver.py
 
 # Install Playwright system dependencies and Chromium binary into /opt/playwright.
 # Using a fixed path (instead of /root/.cache) keeps it consistent regardless of which

@@ -238,6 +238,22 @@ async def run_daily_check(
         expiring = [l for l in renewable if l.is_expiring_soon]
         days_by_id = {l.listing_id: l.days_remaining for l in listings}
 
+        # Update listing cache in DB before any download runs: a failing
+        # single-ad download must not leave the accept flow without any data.
+        for listing in listings:
+            await listing_repo.upsert(
+                listing_id=listing.listing_id,
+                chat_id=chat_id,
+                title=listing.title,
+                description=listing.description,
+                price=listing.price,
+                category=listing.category,
+                days_remaining=listing.days_remaining,
+                shipping_type=listing.shipping_type,
+                shipping_costs=listing.shipping_costs,
+                shipping_options=listing.shipping_options,
+            )
+
         if not expiring:
             if not renewable:
                 await context.bot.send_message(
@@ -296,21 +312,6 @@ async def run_daily_check(
             text=header,
             parse_mode="Markdown",
         )
-
-        # Update listing cache in DB
-        for listing in listings:
-            await listing_repo.upsert(
-                listing_id=listing.listing_id,
-                chat_id=chat_id,
-                title=listing.title,
-                description=listing.description,
-                price=listing.price,
-                category=listing.category,
-                days_remaining=listing.days_remaining,
-                shipping_type=listing.shipping_type,
-                shipping_costs=listing.shipping_costs,
-                shipping_options=listing.shipping_options,
-            )
 
         # Process with pagination (5 per page)
         detailed_expiring: list[Listing] = []

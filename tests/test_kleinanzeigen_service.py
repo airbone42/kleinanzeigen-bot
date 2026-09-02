@@ -978,3 +978,196 @@ class TestDraftModel:
         assert "IKEA Kallax Regal" in formatted
         assert "45.00 EUR" in formatted
         assert "Gut erhalten" in formatted
+
+
+class TestCoerceApiPrice:
+    """`price` from m-meine-anzeigen-verwalten.json is not always a number."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (None, 0.0),
+            (True, 0.0),
+            (15, 15.0),
+            (15.5, 15.5),
+            ("15 €", 15.0),
+            ("15,00 €", 15.0),
+            ("1.250 € VB", 1250.0),
+            ("VB", 0.0),
+            ("Zu verschenken", 0.0),
+            ("", 0.0),
+            ({"amount": "25", "currencyCode": "EUR"}, 25.0),
+            ({"priceInEuroCent": 2599}, 25.99),
+            ({}, 0.0),
+        ],
+    )
+    def test_coerce(self, raw, expected):
+        from services.kleinanzeigen import _coerce_api_price
+
+        assert _coerce_api_price(raw) == expected
+
+
+class TestPublishedAdsFetchResilience:
+    """The in-page fetch() of the published-ads API fails sporadically."""
+
+    @staticmethod
+    def _bot() -> MagicMock:
+        bot = MagicMock()
+        bot.root_url = "https://www.kleinanzeigen.de"
+        bot.web_open = AsyncMock()
+        bot.web_execute = AsyncMock()
+        return bot
+
+    @pytest.mark.asyncio
+    async def test_retries_transient_fetch_failure(
+        self, service: "KleinanzeigenService"
+    ) -> None:
+        ads = [{"id": 1, "state": "active"}]
+        fetch = AsyncMock(side_effect=[RuntimeError("TypeError: Failed to fetch"), ads])
+        bot = self._bot()
+
+        with patch("kleinanzeigen_bot.published_ads.fetch_published_ads", new=fetch):
+            with patch("services.kleinanzeigen.PUBLISHED_ADS_RETRY_DELAY", 0):
+                result = await service._fetch_published_ads_resilient(bot)
+
+        assert result == ads
+        assert fetch.await_count == 2
+        bot.web_open.assert_awaited_once_with(bot.root_url)
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_navigation(self, service: "KleinanzeigenService") -> None:
+        import json
+
+        fetch = AsyncMock(side_effect=RuntimeError("TypeError: Failed to fetch"))
+        bot = self._bot()
+        bot.web_execute.return_value = json.dumps(
+            {"ads": [{"id": 7, "state": "active", "title": "X"}], "paging": {"pageNum": 1, "last": 1}}
+        )
+
+        with patch("kleinanzeigen_bot.published_ads.fetch_published_ads", new=fetch):
+            with patch("services.kleinanzeigen.PUBLISHED_ADS_RETRY_DELAY", 0):
+                result = await service._fetch_published_ads_resilient(bot)
+
+        assert [ad["id"] for ad in result] == [7]
+
+    @pytest.mark.asyncio
+    async def test_navigation_fallback_paginates(
+        self, service: "KleinanzeigenService"
+    ) -> None:
+        import json
+
+        bot = self._bot()
+        bot.web_execute.side_effect = [
+            json.dumps({"ads": [{"id": 1, "state": "active"}], "paging": {"pageNum": 1, "next": 2, "last": 2}}),
+            json.dumps({"ads": [{"id": 2, "state": "active"}], "paging": {"pageNum": 2, "last": 2}}),
+        ]
+
+        result = await service._fetch_published_ads_via_navigation(bot)
+
+        assert [ad["id"] for ad in result] == [1, 2]
+        assert bot.web_open.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_navigation_fallback_ignores_non_json(
+        self, service: "KleinanzeigenService"
+    ) -> None:
+        bot = self._bot()
+        bot.web_execute.return_value = "<html>Anmelden</html>"
+
+        assert await service._fetch_published_ads_via_navigation(bot) == []
+
+    @pytest.mark.asyncio
+    async def test_raises_when_fallback_also_fails(
+        self, service: "KleinanzeigenService"
+    ) -> None:
+        from services.kleinanzeigen import KleinanzeigenError
+
+        fetch = AsyncMock(side_effect=RuntimeError("TypeError: Failed to fetch"))
+        bot = self._bot()
+        bot.web_open.side_effect = [None, None, RuntimeError("navigation dead")]
+
+        with patch("kleinanzeigen_bot.published_ads.fetch_published_ads", new=fetch):
+            with patch("services.kleinanzeigen.PUBLISHED_ADS_RETRY_DELAY", 0):
+                with pytest.raises(KleinanzeigenError):
+                    await service._fetch_published_ads_resilient(bot)
+
+
+class TestExtractBotError:
+    """User-visible publish errors must name the real cause, not setup noise."""
+
+    NODRIVER_WARNING = (
+        "[WARNING] nodriver CDP re-attach patch not found: installed nodriver may miss "
+        "the flat-mode fix. Symptom: repeated `Re-attaching CDP session after -32601`."
+    )
+
+    def test_error_line_wins_over_earlier_warning(self, service: "KleinanzeigenService") -> None:
+        output = (
+            f"{self.NODRIVER_WARNING}\n"
+            "[DEBUG] Re-attaching CDP session after -32601\n"
+            "[ERROR] All 3 attempts failed for [Foo]: No HTML element found using XPath '//a'.\n"
+        )
+        assert service._extract_bot_error(output).startswith("[ERROR] All 3 attempts failed")
+
+    def test_noise_warning_is_ignored(self, service: "KleinanzeigenService") -> None:
+        assert service._extract_bot_error(self.NODRIVER_WARNING) == "Unbekannter Fehler (Details: /logs)"
+
+    def test_real_warning_is_kept(self, service: "KleinanzeigenService") -> None:
+        output = f"{self.NODRIVER_WARNING}\n[WARNING] Attempt 1/3 failed for 'Foo': boom\n"
+        assert service._extract_bot_error(output) == "[WARNING] Attempt 1/3 failed for 'Foo': boom"
+
+    def test_last_error_wins(self, service: "KleinanzeigenService") -> None:
+        output = "[ERROR] first\n[ERROR] second\n"
+        assert service._extract_bot_error(output) == "[ERROR] second"
+
+    def test_validation_details_are_appended(self, service: "KleinanzeigenService") -> None:
+        output = (
+            "2026-09-01 04:18:55,362 [ERROR] 1 validation error for [Ad]:\n"
+            "- : Value error, sell_directly requires shipping_type to be SHIPPING\n"
+            "\n"
+            " _    _      _\n"
+        )
+        result = service._extract_bot_error(output)
+        assert result.endswith("sell_directly requires shipping_type to be SHIPPING")
+        assert "_    _" not in result
+
+
+class TestDeleteListing:
+    """delete_listing must not trip the bot's ad validation."""
+
+    @pytest.mark.asyncio
+    async def test_temp_yaml_overrides_conflicting_ad_defaults(
+        self, service: "KleinanzeigenService"
+    ) -> None:
+        """config.yaml ad_defaults may pair PICKUP with sell_directly: true, which is invalid."""
+        written: dict = {}
+
+        async def fake_run_cli(*args, **kwargs):
+            temp_yaml = service.ads_dir / "_del_12345" / "ad.yaml"
+            with open(temp_yaml, encoding="utf-8") as f:
+                written.update(yaml.safe_load(f))
+            return 0, "", ""
+
+        with patch.object(service, "_pre_session_setup", new=AsyncMock()), \
+             patch.object(service, "_run_cli", new=fake_run_cli):
+            assert await service.delete_listing("12345") is True
+
+        assert written["shipping_type"] == "PICKUP"
+        assert written["sell_directly"] is False
+
+    @pytest.mark.asyncio
+    async def test_failure_message_uses_extracted_error(
+        self, service: "KleinanzeigenService"
+    ) -> None:
+        from services.kleinanzeigen import KleinanzeigenError
+
+        stderr = (
+            "2026-09-01 04:18:55,362 [ERROR] 1 validation error for [Ad]:\n"
+            "- : Value error, sell_directly requires shipping_type to be SHIPPING\n"
+        )
+        with patch.object(service, "_pre_session_setup", new=AsyncMock()), \
+             patch.object(service, "_run_cli", new=AsyncMock(return_value=(1, "banner", stderr))):
+            with pytest.raises(KleinanzeigenError) as exc:
+                await service.delete_listing("12345")
+
+        assert "sell_directly requires shipping_type to be SHIPPING" in str(exc.value)
+        assert "banner" not in str(exc.value)
