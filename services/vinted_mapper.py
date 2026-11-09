@@ -30,6 +30,20 @@ KA_OPTION_TO_SIZE: dict[str, str] = {
     "DHL_5": "M", "Hermes_M": "M",
     "DHL_10": "L", "Hermes_L": "L", "DHL_20": "L", "DHL_31,5": "L",
 }
+# Dynamic attribute "language_book" (global ids, Vinted upload form, November 2026).
+BOOK_LANGUAGE_IDS: dict[str, int] = {
+    "deutsch": 6437, "englisch": 6435, "französisch": 6436, "spanisch": 6438,
+    "italienisch": 6439, "polnisch": 6440, "niederländisch": 6441, "portugiesisch": 6442,
+    "schwedisch": 6443, "russisch": 6444, "kroatisch": 6445, "katalanisch": 6446,
+    "ungarisch": 6447, "rumänisch": 6448, "finnisch": 6449, "japanisch": 6450,
+    "griechisch": 6451, "dänisch": 6452, "türkisch": 6453, "litauisch": 6454,
+    "chinesisch": 6455, "baskisch": 6456, "galicisch": 6457, "arabisch": 6458,
+    "tschechisch": 6459, "ukrainisch": 6460, "walisisch": 6461, "norwegisch": 6462,
+    "latein": 6463, "koreanisch": 6464, "hindi": 6465, "serbisch": 6466, "bulgarisch": 6467,
+    "slowakisch": 6468, "slowenisch": 6469, "lettisch": 6470, "estnisch": 6471,
+    "hebräisch": 6472, "persisch": 6473, "irisch": 6474, "bretonisch": 6475, "andere": 6476,
+    "luxemburgisch": 6477,
+}
 TITLE_MAX = 100
 DESCRIPTION_MAX = 2000
 MAX_PHOTOS = 20
@@ -47,6 +61,9 @@ class VintedFields:
     brand: Optional[str] = None
     condition: str = "good"
     size: Optional[str] = None
+    color: Optional[str] = None
+    isbn: Optional[str] = None
+    book_language: Optional[str] = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -157,7 +174,13 @@ def _listing_text(title: str, description: str, ka_category: str) -> str:
 
 
 async def choose_vinted_fields(
-    llm: Any, *, title: str, description: str, ka_category: str, leaves: list[dict[str, Any]]
+    llm: Any,
+    *,
+    title: str,
+    description: str,
+    ka_category: str,
+    leaves: list[dict[str, Any]],
+    colors: Optional[list[str]] = None,
 ) -> VintedFields:
     """Two LLM steps: pick a category group, then the leaf plus brand/condition/size."""
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -187,9 +210,15 @@ async def choose_vinted_fields(
             "Du füllst ein Vinted-Inserat aus. Antworte nur mit JSON: "
             '{"catalog_id": <id aus der Liste>, "brand": "<Marke oder null>", '
             '"condition": "new_with_tags|new_without_tags|very_good|good|satisfactory", '
-            '"size": "<Größe wie auf dem Etikett, z.B. M, 42, 38/40, oder null>"}. '
+            '"size": "<Größe wie auf dem Etikett, z.B. M, 42, 38/40, oder null>", '
+            '"color": "<genau eine Farbe aus der Farbliste>", '
+            '"isbn": "<ISBN aus dem Text oder null>", '
+            '"book_language": "<nur bei Büchern: Sprache des Buches auf Deutsch, z.B. Deutsch>"}. '
             "Marke nur, wenn sie im Text steht. Zustand aus der Beschreibung, im Zweifel good. "
-            "Größe nur für Kleidung und Schuhe."
+            "Größe nur für Kleidung und Schuhe. Farbe: die Hauptfarbe des Artikels, bei Büchern "
+            "die des Umschlags, im Zweifel die naheliegendste. ISBN nur, wenn sie im Text steht, "
+            "nie raten."
+            + (f"\nFarbliste: {', '.join(colors)}" if colors else "")
         )),
         HumanMessage(content=listing + "\n\nKategorien (id: Pfad):\n"
                      + "\n".join(f"{leaf['id']}: {leaf['path']}" for leaf in candidates)),
@@ -210,7 +239,108 @@ async def choose_vinted_fields(
     fields.condition = condition if condition in CONDITION_IDS else "good"
     size = data.get("size")
     fields.size = size.strip() if isinstance(size, str) and size.strip() and size.lower() != "null" else None
+    color = data.get("color")
+    fields.color = color.strip() if isinstance(color, str) and color.strip() else None
+    fields.isbn = normalize_isbn(data.get("isbn")) or find_isbn(description)
+    language = data.get("book_language")
+    fields.book_language = language.strip() if isinstance(language, str) and language.strip() else None
     return fields
+
+
+def book_language_id(language: Optional[str]) -> int:
+    """Vinted id of a book language; German when unknown (a German Kleinanzeigen listing)."""
+    return BOOK_LANGUAGE_IDS.get((language or "").strip().lower(), BOOK_LANGUAGE_IDS["deutsch"])
+
+
+def _isbn_ok(digits: str) -> bool:
+    if len(digits) == 13 and digits.isdigit():
+        total = sum(int(d) * (1 if i % 2 == 0 else 3) for i, d in enumerate(digits[:12]))
+        return (10 - total % 10) % 10 == int(digits[12])
+    if len(digits) == 10 and digits[:9].isdigit() and (digits[9].isdigit() or digits[9] == "X"):
+        total = sum(int(d) * (10 - i) for i, d in enumerate(digits[:9]))
+        check = 10 if digits[9] == "X" else int(digits[9])
+        return (total + check) % 11 == 0
+    return False
+
+
+def normalize_isbn(value: object) -> Optional[str]:
+    """Digits of a valid ISBN-10/13 (checksum verified), else None."""
+    if not isinstance(value, str):
+        return None
+    digits = re.sub(r"[^0-9Xx]", "", value).upper()
+    return digits if _isbn_ok(digits) else None
+
+
+def find_isbn(text: str) -> Optional[str]:
+    for match in re.finditer(r"(?:97[89][\s-]?)?(?:\d[\s-]?){9}[\dXx]", text or ""):
+        isbn = normalize_isbn(match.group(0))
+        if isbn:
+            return isbn
+    return None
+
+
+def pick_color(colors: list[dict[str, Any]], wanted: Optional[str]) -> Optional[int]:
+    if not wanted:
+        return None
+    wanted_norm = wanted.strip().lower()
+    for color in colors:
+        if str(color.get("title") or "").strip().lower() == wanted_norm and isinstance(color.get("id"), int):
+            return color["id"]
+    return None
+
+
+def needs_isbn(catalog_path: str) -> bool:
+    return "bücher" in catalog_path.lower() or "books" in catalog_path.lower()
+
+
+def format_validation_errors(body: str) -> str:
+    """'photos: Fehler beim Hochladen; isbn: ...' from a Vinted 4xx body."""
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return (body or "")[:200]
+    errors = data.get("errors") if isinstance(data, dict) else None
+    if isinstance(errors, list) and errors:
+        return "; ".join(
+            f"{e.get('field')}: {e.get('value')}" for e in errors if isinstance(e, dict)
+        )[:400]
+    return str(data.get("message") or body)[:200] if isinstance(data, dict) else body[:200]
+
+
+def error_fields(body: str) -> set[str]:
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    errors = data.get("errors") if isinstance(data, dict) else None
+    return {str(e.get("field")) for e in errors or [] if isinstance(e, dict)}
+
+
+# Errors a fresh attempt can fix by itself (photo processing on Vinted's side).
+TRANSIENT_ERROR_FIELDS = frozenset({"photos"})
+
+
+JPEG_MAX_SIDE = 1600
+
+
+def to_jpeg(image: bytes) -> bytes:
+    """Re-encode any photo (Kleinanzeigen often serves WebP) as a JPEG Vinted accepts."""
+    if image[:3] == b"\xff\xd8\xff" and len(image) < 3_000_000:
+        return image
+    try:
+        import io
+
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(image)) as img:
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            img.thumbnail((JPEG_MAX_SIDE, JPEG_MAX_SIDE))
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=88)
+            return out.getvalue()
+    except Exception as e:
+        logger.warning(f"Could not convert photo to JPEG: {e}")
+        return image
 
 
 def pick_brand(brands: list[dict[str, Any]], wanted: str) -> tuple[Optional[int], Optional[str]]:
@@ -247,6 +377,9 @@ def build_draft(
     brand_id: Optional[int] = None,
     brand: Optional[str] = None,
     size_id: Optional[int] = None,
+    color_ids: Optional[list[int]] = None,
+    isbn: Optional[str] = None,
+    attributes: Optional[dict[str, list[int]]] = None,
 ) -> dict[str, Any]:
     """The ``draft`` object in the shape of the captured web-app request."""
     item_attributes: list[dict[str, Any]] = [
@@ -254,6 +387,8 @@ def build_draft(
     ]
     if size_id is not None:
         item_attributes.append({"code": "size", "ids": [size_id]})
+    for code, ids in (attributes or {}).items():
+        item_attributes.append({"code": code, "ids": list(ids)})
     return {
         "id": None,
         "currency": currency,
@@ -263,13 +398,13 @@ def build_draft(
         "brand_id": brand_id,
         "brand": brand,
         "catalog_id": catalog_id,
-        "isbn": None,
+        "isbn": isbn,
         "is_unisex": False,
         "ai_photo": False,
         "price": price,
         "package_size_id": PACKAGE_SIZE_IDS[package_size],
         "shipment_prices": {"domestic": None, "international": None},
-        "color_ids": [],
+        "color_ids": list(color_ids or []),
         "assigned_photos": [{"id": pid, "orientation": 0} for pid in photo_ids[:MAX_PHOTOS]],
         "measurement_length": None,
         "measurement_width": None,

@@ -95,6 +95,22 @@ def parse_cookie_header(raw: str) -> dict[str, str]:
     return cookies
 
 
+# Imported besides the tokens. Bot-protection cookies (datadome, cf_clearance) are bound
+# to the owner's browser and IP; the bot's own Chromium has to earn its own.
+EXTRA_SESSION_COOKIES = ("v_uid", "v_sid", "anon_id", "user-iso-locale", "domain_selected")
+SESSION_COOKIE_RE = re.compile(r"^_vinted_[a-z]{2}_session$")
+
+
+def session_cookies(cookies: dict[str, str]) -> dict[str, str]:
+    """Only the cookies that make up the login, nothing for tracking or bot protection."""
+    return {
+        name: value
+        for name, value in cookies.items()
+        if value and (name in SESSION_COOKIES or name in EXTRA_SESSION_COOKIES
+                      or SESSION_COOKIE_RE.match(name))
+    }
+
+
 def jwt_claims(token: str) -> dict[str, Any]:
     """Decode the payload of a JWT without verifying it (only to read sub/exp)."""
     try:
@@ -131,6 +147,14 @@ def extract_csrf_token(page_html: str) -> Optional[str]:
         if match:
             return match.group(1)
     return None
+
+
+def summarize_photo(photo: dict[str, Any]) -> dict[str, Any]:
+    """Photo object without URLs, for the log."""
+    return {
+        k: v for k, v in photo.items()
+        if not isinstance(v, (dict, list)) and "url" not in k.lower() and k != "dominant_color"
+    }
 
 
 def find_chromium(configured: str = "") -> Optional[str]:
@@ -179,6 +203,7 @@ class VintedClient:
     async def __aexit__(self, *exc: object) -> None:
         try:
             if self.browser is not None:
+                await self._close_gracefully()
                 try:
                     self.browser.stop()
                 except Exception as e:
@@ -188,6 +213,20 @@ class VintedClient:
             self.browser = None
             self.tab = None
             VINTED_LOCK.release()
+
+    async def _close_gracefully(self) -> None:
+        """Browser.close lets Chromium write its cookie store; a plain kill loses the session."""
+        from nodriver import cdp
+
+        process = getattr(self.browser, "_process", None)
+        try:
+            await asyncio.wait_for(self.tab.send(cdp.browser.close()), timeout=5)
+        except Exception as e:
+            logger.debug(f"Browser.close: {e}")
+        for _ in range(20):
+            if process is None or process.returncode is not None:
+                break
+            await asyncio.sleep(0.5)
 
     def _kill_orphans(self) -> None:
         """Kill Chromium processes still holding the Vinted profile (Linux only)."""
@@ -247,36 +286,77 @@ class VintedClient:
         raise VintedError(f"Browser für Vinted startet nicht: {last_error}")
 
     # ----- cookies / session ------------------------------------------------
-    async def _cookies(self) -> dict[str, str]:
+    async def _raw_cookies(self) -> list[Any]:
+        base = cookie_domain(self.base_url).lstrip(".")
         cookies = await self.browser.cookies.get_all()
-        domain = cookie_domain(self.base_url)
+        return [c for c in cookies if str(getattr(c, "domain", "") or "").lstrip(".").endswith(base)]
+
+    async def _cookies(self) -> dict[str, str]:
+        """Vinted cookies by name. For the tokens the logged-in variant wins.
+
+        Every visit without a session gets anonymous tokens (JWT without ``sub``), and
+        Vinted keeps them on two domains (access on .vinted.de, refresh on
+        .www.vinted.de), so the profile can hold several cookies of the same name.
+        """
         out: dict[str, str] = {}
-        for c in cookies:
-            c_domain = str(getattr(c, "domain", "") or "")
-            if c_domain.endswith(domain.lstrip(".")):
-                out[str(c.name)] = str(c.value)
+        best_exp: dict[str, float] = {}
+        for c in await self._raw_cookies():
+            name, value = str(c.name), str(c.value)
+            if name in SESSION_COOKIES:
+                claims = jwt_claims(value)
+                score = (1e12 if claims.get("sub") else 0) + float(claims.get("exp") or 0)
+                if score <= best_exp.get(name, -1):
+                    continue
+                best_exp[name] = score
+            out[name] = value
         return out
 
     async def import_cookies(self, cookies: dict[str, str]) -> None:
-        """Store pasted session cookies in the profile."""
+        """Replace the profile's Vinted cookies with the pasted session.
+
+        Domains as Vinted sets them itself (checked 09.11.2026): access_token_web on
+        .vinted.de, refresh_token_web on .www.vinted.de, the rest host-only. anon_id
+        must match the token's ``anid`` claim. Leftover anonymous tokens made Vinted
+        swap the imported session for an anonymous one.
+        """
         from nodriver import cdp
 
         missing = [name for name in SESSION_COOKIES if not cookies.get(name)]
         if missing:
             raise VintedAuthError(f"Es fehlen die Cookies {', '.join(missing)}.")
-        domain = cookie_domain(self.base_url)
-        params = [
-            cdp.network.CookieParam(
-                name=name,
-                value=value,
-                domain=domain,
-                path="/",
-                secure=True,
-                http_only=name in SESSION_COOKIES,
+        claims = jwt_claims(cookies["access_token_web"])
+        if not claims.get("sub"):
+            raise VintedAuthError(
+                "Das access_token_web gehört zu keinem Konto (anonym). Erst auf vinted.de "
+                "einloggen, dann den Cookie-Wert kopieren."
             )
-            for name, value in cookies.items()
-            if value
-        ]
+        cookies = session_cookies(cookies)
+        if claims.get("anid"):
+            cookies["anon_id"] = str(claims["anid"])
+
+        for c in await self._raw_cookies():
+            await self.tab.send(cdp.network.delete_cookies(
+                name=str(c.name), domain=str(c.domain), path=str(c.path or "/")))
+
+        host = urlparse(self.base_url).hostname or "www.vinted.de"
+        one_year = time.time() + 365 * 86400
+        params = []
+        for name, value in cookies.items():
+            if name == "access_token_web":
+                where: dict[str, Any] = {"domain": cookie_domain(self.base_url)}
+            elif name == "refresh_token_web":
+                where = {"domain": "." + host}
+            else:
+                where = {"url": f"https://{host}/"}
+            # Without expires Chromium keeps a session cookie and drops it at exit.
+            exp = jwt_claims(value).get("exp") if name in SESSION_COOKIES else None
+            if name == "access_token_web":
+                exp = time.time() + 7 * 86400  # Vinted's own Max-Age; refreshed on use
+            params.append(cdp.network.CookieParam(
+                name=name, value=value, path="/", secure=True,
+                http_only=name in SESSION_COOKIES,
+                expires=cdp.network.TimeSinceEpoch(float(exp or one_year)), **where,
+            ))
         await self.browser.cookies.set_all(params)
         self.tab = await self.browser.get(self.base_url)
         await asyncio.sleep(PAGE_SETTLE_SECONDS)
@@ -286,20 +366,19 @@ class VintedClient:
         cookies = await self._cookies()
         token = cookies.get("access_token_web", "")
         self._anon_id = cookies.get("anon_id", "")
-        if not token_valid(token):
-            if not cookies.get("refresh_token_web"):
-                raise VintedAuthError("Keine Vinted-Sitzung im Browser-Profil (/vintedlogin).")
+        if not token_valid(token) or not jwt_claims(token).get("sub"):
+            if not jwt_claims(cookies.get("refresh_token_web", "")).get("sub"):
+                raise VintedAuthError(
+                    "Keine angemeldete Vinted-Sitzung im Browser-Profil (nur anonym), /vintedlogin."
+                )
             await self._refresh_token()
             cookies = await self._cookies()
             token = cookies.get("access_token_web", "")
-            if not token_valid(token):
+            if not token_valid(token) or not jwt_claims(token).get("sub"):
                 raise VintedAuthError("Vinted-Sitzung abgelaufen, bitte /vintedlogin erneut.")
         self._access_token = token
-        user_id = str(jwt_claims(token).get("sub") or "")
-        if not user_id:
-            raise VintedAuthError("Vinted-Token ohne Benutzer-ID.")
-        self.user_id = user_id
-        return user_id
+        self.user_id = str(jwt_claims(token)["sub"])
+        return self.user_id
 
     async def _refresh_token(self) -> None:
         result = await self._fetch("POST", f"{self.base_url}/web/api/auth/refresh", auth=False)
@@ -431,6 +510,8 @@ class VintedClient:
         data = json.loads(text)
         photo = data.get("photo") if isinstance(data.get("photo"), dict) else data
         photo_id = photo.get("id")
+        logger.info(f"Vinted photo upload: {len(image)} bytes, magic {image[:4].hex()}, "
+                    f"response {summarize_photo(photo)}")
         if not isinstance(photo_id, int):
             raise VintedApiError("Foto-Upload", status, f"keine Foto-ID: {text[:200]}")
         return photo_id
@@ -445,6 +526,16 @@ class VintedClient:
         if not isinstance(item, dict) or not item.get("id"):
             raise VintedError(f"Entwurf ohne ID zurückgegeben: {str(data)[:200]}")
         return item
+
+    async def update_draft(
+        self, draft_id: int, draft: dict[str, Any], upload_session_id: str
+    ) -> dict[str, Any]:
+        """Replace a draft's data. Photos must be freshly uploaded ids (old ones wipe them)."""
+        await self._ensure_csrf()
+        body = {"draft": {**draft, "id": draft_id}, "feedback_id": None, "parcel": None,
+                "upload_session_id": upload_session_id}
+        return await self.api("PUT", f"/item_upload/drafts/{draft_id}", body,
+                              what="Entwurf ändern", headers=DYNAMIC_ATTRIBUTE_HEADERS)
 
     async def complete_draft(
         self, draft_id: int, draft: dict[str, Any], upload_session_id: str
@@ -498,6 +589,11 @@ class VintedClient:
         await self._ensure_csrf()
         await self.api("POST", f"/items/{item_id}/delete", {}, what="Artikel löschen")
 
+    async def delete_draft(self, draft_id: int) -> None:
+        """Drafts reject /items/{id}/delete (HTTP 400 InvalidRequest, 09.11.2026)."""
+        await self._ensure_csrf()
+        await self.api("DELETE", f"/item_upload/drafts/{draft_id}", what="Entwurf löschen")
+
     async def catalogs(self) -> list[dict[str, Any]]:
         data = await self.api("GET", "/item_upload/catalogs", what="Kategorien lesen")
         catalogs = data.get("catalogs")
@@ -509,6 +605,11 @@ class VintedClient:
         data = await self.api("GET", f"/brands?keyword={quote(keyword)}", what="Marke suchen")
         brands = data.get("brands")
         return brands if isinstance(brands, list) else []
+
+    async def colors(self) -> list[dict[str, Any]]:
+        data = await self.api("GET", "/colors", what="Farben lesen")
+        colors = data.get("colors")
+        return colors if isinstance(colors, list) else []
 
     async def size_groups(self, catalog_id: int) -> list[dict[str, Any]]:
         data = await self.api("GET", f"/size_groups?catalog_ids={catalog_id}", what="Größen lesen")

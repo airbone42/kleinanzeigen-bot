@@ -25,6 +25,7 @@ dependencies = [
     # Pinned to a fixed commit for reproducible builds (was a moving @main ref).
     "kleinanzeigen-bot @ git+https://github.com/Second-Hand-Friends/kleinanzeigen-bot.git@d211ca4",
     "discogs-client>=2.3.0",
+    "pillow>=10.0",
 ]
 
 [project.urls]

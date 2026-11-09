@@ -227,7 +227,12 @@ async def build_application() -> Application:
     from bot.handlers.discogs_sync import discogs_sync_handler
     from bot.handlers.diagnose import diagnose_handler
     from bot.handlers.logs import logs_handler
-    from bot.handlers.vinted import vinted_login_handler, vinted_status_handler, vinted_sync_handler
+    from bot.handlers.vinted import (
+        vinted_login_handler,
+        vinted_retry_handler,
+        vinted_status_handler,
+        vinted_sync_handler,
+    )
 
     app = Application.builder().token(settings.telegram_bot_token).build()
 
@@ -254,6 +259,7 @@ async def build_application() -> Application:
     app.add_handler(CommandHandler("vinted", vinted_status_handler, filters=user_f))
     app.add_handler(CommandHandler("vintedsync", vinted_sync_handler, filters=user_f))
     app.add_handler(CommandHandler("vintedlogin", vinted_login_handler, filters=user_f))
+    app.add_handler(CommandHandler("vintedretry", vinted_retry_handler, filters=user_f))
 
     # Photo handler (for new listings)
     app.add_handler(MessageHandler(filters.PHOTO & user_f, photo_handler))

@@ -12,6 +12,7 @@ Rules (docs/vinted.md):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -23,17 +24,27 @@ from typing import Any, Optional
 from config.settings import settings
 from db.repository import discogs_mapping_repo, vinted_mapping_repo
 from models.listing import Listing
+from services.isbn_lookup import find_book_isbn
 from services.vinted_client import (
     VintedApiError,
     VintedAuthError,
     VintedClient,
     VintedError,
     parse_cookie_header,
+    summarize_photo,
 )
 from services.vinted_mapper import (
     build_draft,
     choose_vinted_fields,
     flatten_catalogs,
+    TRANSIENT_ERROR_FIELDS,
+    book_language_id,
+    error_fields,
+    format_validation_errors,
+    needs_isbn,
+    normalize_isbn,
+    pick_color,
+    to_jpeg,
     item_flags,
     item_state,
     pick_brand,
@@ -48,6 +59,14 @@ logger = logging.getLogger(__name__)
 PROFILE_DIR_NAME = "vinted-profile"
 CACHE_DIR_NAME = "vinted"
 CATALOG_CACHE_FILE = "catalogs.json"
+COLOR_CACHE_FILE = "colors.json"
+# Vinted processes uploaded photos asynchronously; publishing right away fails with
+# "photos: Fehler beim Hochladen".
+PHOTO_SETTLE_SECONDS = 6
+PHOTO_RETRY_SECONDS = 20
+# Present while the last Vinted contact had no valid session: skips the backfill, whose
+# Kleinanzeigen downloads would be wasted (about a minute of browser time each).
+AUTH_MARKER_FILE = "auth_required"
 MAX_MIRROR_ATTEMPTS = 3
 KA_ID_RE = re.compile(r"(\d{6,})")
 
@@ -66,10 +85,11 @@ class MirrorInput:
 
 @dataclass
 class MirrorResult:
-    status: str  # active | draft | skipped | failed
+    status: str  # active | draft | skipped | failed | unchanged
     message: str
     vinted_item_id: Optional[str] = None
     url: Optional[str] = None
+    retry: bool = False  # draft: a fresh attempt may succeed (transient error)
 
 
 @dataclass
@@ -93,6 +113,18 @@ class SyncReport:
         parts += [f"• {line}" for line in self.lines]
         parts += [f"⚠️ {line}" for line in self.errors]
         return "\n".join(parts)
+
+
+def describe_image(image: bytes) -> str:
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image)) as img:
+            return f"{img.format} {img.size[0]}x{img.size[1]} {img.mode}, {len(image)} bytes"
+    except Exception as e:
+        return f"unreadable ({e.__class__.__name__}), {len(image)} bytes, magic {image[:8].hex()}"
 
 
 def ka_id_from_url(url: Optional[str]) -> Optional[str]:
@@ -120,6 +152,20 @@ class VintedSyncService:
             chromium_path=settings.chromium_path,
         )
 
+    def _set_auth_required(self, required: bool) -> None:
+        marker = self.cache_dir / AUTH_MARKER_FILE
+        try:
+            if required:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                marker.touch()
+            else:
+                marker.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"Vinted auth marker: {e}")
+
+    def auth_required(self) -> bool:
+        return (self.cache_dir / AUTH_MARKER_FILE).exists()
+
     def item_url(self, item_id: object) -> str:
         return f"{settings.vinted_base_url.rstrip('/')}/items/{item_id}"
 
@@ -130,6 +176,7 @@ class VintedSyncService:
             await client.import_cookies(cookies)
             user_id = await client.ensure_session()
             await client.wardrobe_items()  # proves the session works for the API
+        self._set_auth_required(False)
         return user_id
 
     # ----- catalog ------------------------------------------------------------
@@ -149,13 +196,37 @@ class VintedSyncService:
         cache.write_text(json.dumps(leaves, ensure_ascii=False), encoding="utf-8")
         return leaves
 
+    async def _colors(self, client: VintedClient) -> list[dict[str, Any]]:
+        cache = self.cache_dir / COLOR_CACHE_FILE
+        if cache.exists():
+            try:
+                colors = json.loads(cache.read_text(encoding="utf-8"))
+                if isinstance(colors, list) and colors:
+                    return colors
+            except (OSError, json.JSONDecodeError):
+                pass
+        try:
+            colors = [c for c in await client.colors() if isinstance(c, dict)]
+        except VintedApiError as e:
+            logger.warning(f"Vinted colors not available: {e}")
+            return []
+        if colors:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(colors, ensure_ascii=False), encoding="utf-8")
+        return colors
+
     # ----- mirror one listing ------------------------------------------------
     async def mirror(self, inp: MirrorInput, client: Optional[VintedClient] = None) -> MirrorResult:
         """Put one Kleinanzeigen listing on Vinted and record the mapping."""
         existing = await vinted_mapping_repo.get_by_ka(inp.ka_listing_id)
+        retry_draft_id: Optional[int] = None
         if existing is not None and existing["status"] in vinted_mapping_repo.LIVE_STATUSES:
-            return MirrorResult(existing["status"], "schon auf Vinted",
-                                existing["vinted_item_id"], existing["vinted_url"])
+            if (existing["status"] == "draft" and existing["vinted_item_id"]
+                    and existing["attempts"] < MAX_MIRROR_ATTEMPTS):
+                retry_draft_id = int(existing["vinted_item_id"])  # our rejected draft
+            else:
+                return MirrorResult("unchanged", "schon auf Vinted",
+                                    existing["vinted_item_id"], existing["vinted_url"])
 
         reason = skip_reason(inp.price, inp.package_size)
         if reason is None and not inp.images:
@@ -169,9 +240,9 @@ class VintedSyncService:
             if client is None:
                 async with self.client() as own_client:
                     await own_client.ensure_session()
-                    result = await self._mirror_with(own_client, inp)
+                    result = await self._mirror_with(own_client, inp, retry_draft_id)
             else:
-                result = await self._mirror_with(client, inp)
+                result = await self._mirror_with(client, inp, retry_draft_id)
         except VintedAuthError:
             raise
         except Exception as e:
@@ -185,16 +256,23 @@ class VintedSyncService:
             inp.ka_listing_id, status=result.status, chat_id=inp.chat_id,
             vinted_item_id=result.vinted_item_id, vinted_url=result.url, title=inp.title,
             price=inp.price, last_error=None if result.status == "active" else result.message,
+            count_attempt=result.status == "draft",
         )
+        if result.status == "draft" and not result.retry:
+            await vinted_mapping_repo.set_attempts(inp.ka_listing_id, MAX_MIRROR_ATTEMPTS)
         return result
 
-    async def _mirror_with(self, client: VintedClient, inp: MirrorInput) -> MirrorResult:
+    async def _mirror_with(
+        self, client: VintedClient, inp: MirrorInput, draft_id: Optional[int] = None
+    ) -> MirrorResult:
         from services.openrouter import get_text_llm
 
         leaves = await self._leaves(client)
+        colors = await self._colors(client)
         fields = await choose_vinted_fields(
             get_text_llm(temperature=0.0), title=inp.title, description=inp.description,
             ka_category=inp.category, leaves=leaves,
+            colors=[str(c.get("title")) for c in colors if c.get("title")],
         )
         if fields.catalog_id is None:
             return MirrorResult("skipped", f"Vinted übersprungen: {', '.join(fields.notes)}")
@@ -209,9 +287,24 @@ class VintedSyncService:
             except VintedApiError as e:
                 logger.info(f"Size lookup failed for catalog {fields.catalog_id}: {e}")
 
+        color_id = pick_color(colors, fields.color)
+        notes: list[str] = []
+        isbn = fields.isbn
+        if isbn is None and needs_isbn(fields.catalog_path):
+            from services.openrouter import get_vision_llm
+
+            isbn, source = await find_book_isbn(
+                text_llm=get_text_llm(temperature=0.0), vision_llm=get_vision_llm(temperature=0.0),
+                title=inp.title, description=inp.description, images=inp.images,
+            )
+            if isbn and source != "Anzeigentext":
+                notes.append(f"ISBN {isbn} aus {source}, bitte prüfen")
+
         session_id = str(uuid.uuid4())
+        for i, image in enumerate(inp.images[:20]):
+            logger.info(f"Vinted photo {i}: {describe_image(image)}")
         photo_ids = [
-            await client.upload_photo(image, session_id, filename=f"photo_{i:02d}.jpg")
+            await client.upload_photo(to_jpeg(image), session_id, filename=f"photo_{i:02d}.jpg")
             for i, image in enumerate(inp.images[:20])
         ]
         draft = build_draft(
@@ -220,23 +313,81 @@ class VintedSyncService:
             currency=settings.vinted_currency, catalog_id=fields.catalog_id,
             package_size=inp.package_size, photo_ids=photo_ids, condition=fields.condition,
             brand_id=brand_id, brand=brand, size_id=size_id,
+            color_ids=[color_id] if color_id else [], isbn=isbn,
+            attributes=(
+                {"language_book": [book_language_id(fields.book_language)]}
+                if needs_isbn(fields.catalog_path) else None
+            ),
         )
-        created = await client.create_draft(draft, session_id)
-        item_id = str(created["id"])
+        if draft_id is not None:
+            # Retry: refill our earlier draft (fresh photo ids) instead of a second one.
+            await client.update_draft(draft_id, draft, session_id)
+            item_id = str(draft_id)
+        else:
+            created = await client.create_draft(draft, session_id)
+            item_id = str(created["id"])
         url = self.item_url(item_id)
+        suffix = f" ({'; '.join(notes)})" if notes else ""
+        await asyncio.sleep(PHOTO_SETTLE_SECONDS)
+        draft = await self._with_stored_photos(client, int(item_id), draft)
         try:
-            await client.complete_draft(int(item_id), draft, session_id)
+            try:
+                await client.complete_draft(int(item_id), draft, session_id)
+            except VintedApiError as e:
+                if '"photos"' not in e.body:
+                    raise
+                await asyncio.sleep(PHOTO_RETRY_SECONDS)
+                await client.complete_draft(int(item_id), draft, session_id)
         except VintedApiError as e:
-            # Vinted rejects drafts that miss a field the category demands (size,
-            # brand, ...). The draft stays in the account, the owner finishes it.
+            if '"photos"' in e.body:
+                try:
+                    stored = await client.get_item_edit(int(item_id))
+                    logger.info(
+                        "Vinted draft photos after rejection: "
+                        + json.dumps([summarize_photo(p) for p in stored.get("photos") or []])[:1500]
+                    )
+                except Exception as diag:
+                    logger.info(f"Vinted draft photo diagnosis failed: {diag}")
+            # Transient (photo processing): the next sync deletes the draft and tries
+            # again. A missing field the bot cannot know (ISBN, size, ...): the draft
+            # stays for the owner to finish in the app.
+            fields_failed = error_fields(e.body)
+            retry = bool(fields_failed) and fields_failed <= TRANSIENT_ERROR_FIELDS
+            next_step = (
+                f"Der nächste Abgleich versucht es neu (höchstens {MAX_MIRROR_ATTEMPTS}x)."
+                if retry else "Bitte in der Vinted-App ergänzen und hochladen."
+            )
             return MirrorResult(
                 "draft",
                 f"Vinted-Entwurf angelegt ({fields.catalog_path}), Veröffentlichen abgelehnt: "
-                f"{e.body[:200]}. Bitte in der Vinted-App ergänzen und hochladen.",
-                item_id, url,
+                f"{format_validation_errors(e.body)}{suffix}. {next_step} {url}",
+                item_id, url, retry=retry,
             )
-        return MirrorResult("active", f"Auf Vinted veröffentlicht ({fields.catalog_path}): {url}",
-                            item_id, url)
+        return MirrorResult(
+            "active", f"Auf Vinted veröffentlicht ({fields.catalog_path}){suffix}: {url}", item_id, url
+        )
+
+    @staticmethod
+    async def _with_stored_photos(
+        client: VintedClient, item_id: int, draft: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Swap the upload's temporary photo ids for the draft's stored ones.
+
+        Saving a draft turns each uploaded photo (temporary id) into a stored photo
+        with a new id. Publishing with the temporary ids fails with "photos: Fehler
+        beim Hochladen" (09.11.2026: uploaded 37861594399, stored 46398133641).
+        """
+        try:
+            stored = await client.get_item_edit(item_id)
+        except VintedApiError as e:
+            logger.warning(f"Vinted draft {item_id} not readable before publishing: {e}")
+            return draft
+        photos = [
+            {"id": p["id"], "orientation": p.get("orientation") or 0}
+            for p in sorted(stored.get("photos") or [], key=lambda p: p.get("image_no") or 0)
+            if isinstance(p, dict) and isinstance(p.get("id"), int)
+        ]
+        return {**draft, "assigned_photos": photos} if photos else draft
 
     # ----- hooks from the Kleinanzeigen side ---------------------------------
     async def follow_republish(self, old_ka_id: str, new_ka_id: str, title: str = "") -> None:
@@ -276,12 +427,17 @@ class VintedSyncService:
             report.error("Kleinanzeigen meldet 0 Anzeigen, Abgleich zur Sicherheit übersprungen.")
             return report
 
-        backfill = await self._prepare_backfill(ka, ka_listings, report)
+        if self.auth_required():
+            backfill: list[MirrorInput] = []
+            logger.info("Vinted sync: no session last time, skipping backfill")
+        else:
+            backfill = await self._prepare_backfill(ka, ka_listings, report)
 
         sold_on_vinted: list[Any] = []
         try:
             async with self.client() as client:
                 await client.ensure_session()
+                self._set_auth_required(False)
                 wardrobe = {str(i.get("id")): i for i in await client.wardrobe_items()}
                 if wardrobe:
                     first = next(iter(wardrobe.values()))
@@ -296,9 +452,10 @@ class VintedSyncService:
                         report.error(f"{row['title'][:40]}: {e}")
                 for inp in backfill:
                     result = await self.mirror(inp, client)
-                    if result.status != "skipped":
+                    if result.status not in ("skipped", "unchanged"):
                         report.add(f"{inp.title[:40]}: {result.message}")
         except VintedAuthError as e:
+            self._set_auth_required(True)
             report.auth_required = True
             report.error(f"{e} Abgleich nicht möglich.")
             return report
@@ -369,6 +526,16 @@ class VintedSyncService:
             missing = await vinted_mapping_repo.bump_missing(ka_id)
             if missing < settings.vinted_missing_runs_before_delete:
                 return False
+            if state == "draft":
+                try:
+                    await client.delete_draft(int(item_id))
+                    report.add(f"Auf Kleinanzeigen weg, Vinted-Entwurf gelöscht: {title}")
+                except VintedApiError as e:
+                    # A draft is invisible to buyers; nothing can sell twice.
+                    report.add(f"Auf Kleinanzeigen weg, Vinted-Entwurf bitte in der App löschen "
+                               f"({e.status}): {title}")
+                await vinted_mapping_repo.set_status(ka_id, "sold_ka")
+                return False
             await client.delete_item(int(item_id))
             await vinted_mapping_repo.set_status(ka_id, "sold_ka")
             report.add(f"Auf Kleinanzeigen weg, Vinted-Artikel gelöscht: {title}")
@@ -413,7 +580,9 @@ class VintedSyncService:
             if listing.status == "reserved":
                 continue
             row = known.get(listing.listing_id)
-            if row is not None and (row["status"] != "failed" or row["attempts"] >= MAX_MIRROR_ATTEMPTS):
+            # failed, or our rejected draft that the reconcile step below deletes first
+            retry = row is not None and row["status"] in ("failed", "draft") and row["attempts"] < MAX_MIRROR_ATTEMPTS
+            if row is not None and not retry:
                 continue
             # Discogs owns these records: a Vinted sale would not reach the Discogs inventory.
             if any(discogs_mapping_repo.matches_listing(r, listing.listing_id, listing.title) for r in discogs_rows):

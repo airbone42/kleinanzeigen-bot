@@ -237,6 +237,11 @@ async def text_message_handler(
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
     text = update.message.text or ""
 
+    from bot.handlers.vinted import consume_vinted_login_part
+
+    if await consume_vinted_login_part(update, context):
+        return
+
     user_state = _user_states.get(chat_id)
     if not user_state:
         # Possibly the answer to a question about unrecognized photos.

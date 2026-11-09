@@ -414,6 +414,24 @@ class VintedMappingRepository:
             )
             await conn.commit()
 
+    async def set_attempts(self, ka_listing_id: str, attempts: int) -> None:
+        async for conn in get_connection():
+            await conn.execute(
+                "UPDATE vinted_mappings SET attempts = ? WHERE ka_listing_id = ?",
+                (attempts, str(ka_listing_id)),
+            )
+            await conn.commit()
+
+    async def reset_attempts(self) -> int:
+        """Let rejected drafts and failed mirrors try again (after a fix)."""
+        async for conn in get_connection():
+            cursor = await conn.execute(
+                "UPDATE vinted_mappings SET attempts = 0 WHERE status IN ('draft', 'failed')"
+            )
+            await conn.commit()
+            return cursor.rowcount or 0
+        return 0
+
     async def bump_missing(self, ka_listing_id: str) -> int:
         """Count one more sync run without the listing on Kleinanzeigen; returns the count."""
         async for conn in get_connection():

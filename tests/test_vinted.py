@@ -158,6 +158,7 @@ class FakeClient:
         self.hidden: list[tuple[int, bool]] = []
         self.drafts: list[dict] = []
         self.missing: set[int] = set()
+        self.photo_errors = 0
 
     async def __aenter__(self) -> "FakeClient":
         return self
@@ -174,7 +175,8 @@ class FakeClient:
     async def get_item_edit(self, item_id: int) -> dict:
         if item_id in self.missing:
             raise VintedApiError("Artikel lesen", 404, "not found")
-        return {"id": item_id, "is_draft": True}
+        return {"id": item_id, "is_draft": True,
+                "photos": [{"id": 46000 + n, "image_no": n + 1} for n in range(len(self.drafts[-1]["assigned_photos"]) if self.drafts else 0)]}
 
     async def delete_item(self, item_id: int) -> None:
         self.deleted.append(item_id)
@@ -191,6 +193,9 @@ class FakeClient:
     async def size_groups(self, catalog_id: int) -> list[dict]:
         return []
 
+    async def colors(self) -> list[dict]:
+        return [{"id": 1, "title": "Schwarz"}, {"id": 12, "title": "Blau"}]
+
     async def upload_photo(self, image: bytes, temp_uuid: str, filename: str = "") -> int:
         return 900 + len(image)
 
@@ -199,6 +204,12 @@ class FakeClient:
         return {"id": 555}
 
     async def complete_draft(self, draft_id: int, draft: dict, sid: str) -> dict:
+        self.completions = getattr(self, "completions", 0) + 1
+        self.completed_photos = [p["id"] for p in draft["assigned_photos"]]
+        if self.photo_errors > 0:
+            self.photo_errors -= 1
+            raise VintedApiError("Entwurf veröffentlichen", 422,
+                                 '{"errors":[{"field":"photos","value":"Fehler beim Hochladen"}]}')
         if self.fail_completion:
             raise VintedApiError("Entwurf veröffentlichen", 422, '{"errors":[{"field":"size"}]}')
         return {"id": draft_id}
@@ -221,7 +232,10 @@ class FakeKA:
 @pytest.fixture
 def svc(monkeypatch: pytest.MonkeyPatch, tmp_path) -> VintedSyncService:
     import services.kleinanzeigen as ka_module
+    import services.vinted_sync as sync_module
 
+    monkeypatch.setattr(sync_module, "PHOTO_SETTLE_SECONDS", 0)
+    monkeypatch.setattr(sync_module, "PHOTO_RETRY_SECONDS", 0)
     monkeypatch.setattr(settings, "kleinanzeigen_config_path", tmp_path)
     monkeypatch.setattr(settings, "vinted_backfill_per_run", 0)
     monkeypatch.setattr(settings, "vinted_missing_runs_before_delete", 2)
@@ -313,9 +327,10 @@ async def test_mirror_publishes_and_records_mapping(svc, monkeypatch) -> None:
 
     monkeypatch.setattr(openrouter, "get_text_llm", lambda temperature=0.0: FakeLLM([
         '{"group": "Damen > Kleidung"}',
-        '{"catalog_id": 100, "brand": "Vaude", "condition": "good", "size": null}',
+        '{"catalog_id": 100, "brand": "Vaude", "condition": "good", "size": null, "color": "Blau"}',
     ]))
     client = FakeClient()
+    client.photo_errors = 1
     result = await svc.mirror(MirrorInput(
         ka_listing_id="910007", title="Vaude Jacke", description="Gut. Abholung möglich.",
         price=30, images=[b"a", b"bb"], package_size="M",
@@ -324,6 +339,9 @@ async def test_mirror_publishes_and_records_mapping(svc, monkeypatch) -> None:
     assert result.status == "active" and result.vinted_item_id == "555"
     assert client.drafts[0]["catalog_id"] == 100
     assert client.drafts[0]["brand_id"] == 3
+    assert client.drafts[0]["color_ids"] == [12]
+    assert client.completions == 2  # one retry after the photo processing error
+    assert client.completed_photos == [46000, 46001]  # stored ids, not the upload's temp ids
     row = await vinted_mapping_repo.get_by_ka("910007")
     assert row["status"] == "active" and row["vinted_url"].endswith("/items/555")
 
@@ -367,3 +385,195 @@ async def test_sold_on_vinted_finds_republished_kleinanzeigen_listing(svc, monke
 
     assert FakeKA.deleted == ["910013"]
     assert (await vinted_mapping_repo.get_by_ka("910013"))["status"] == "sold_vinted"
+
+
+def test_split_login_message_is_joined_and_filtered() -> None:
+    from services.vinted_client import session_cookies
+
+    header = (
+        "datadome=dd1; cf_clearance=cf1; _ga=x; access_token_web=AAA.BBB.CCC; "
+        "refresh_token_web=RRR.SSS.TTT; _vinted_fr_session=sess; v_uid=42"
+    )
+    parts = [header[:47], header[47:120], header[120:]]  # Telegram cuts anywhere
+    cookies = session_cookies(parse_cookie_header("".join(parts)))
+    assert cookies == {
+        "access_token_web": "AAA.BBB.CCC", "refresh_token_web": "RRR.SSS.TTT",
+        "_vinted_fr_session": "sess", "v_uid": "42",
+    }
+
+
+async def test_logged_in_token_wins_over_anonymous_cookie(tmp_path) -> None:
+    from services.vinted_client import VintedClient
+
+    anon = _jwt({"exp": time.time() + 9000, "anid": "a1"})
+    user = _jwt({"sub": "3211", "exp": time.time() + 3600, "anid": "a1"})
+    jar = [
+        SimpleNamespace(name="access_token_web", value=user, domain=".vinted.de", path="/"),
+        SimpleNamespace(name="access_token_web", value=anon, domain=".www.vinted.de", path="/"),
+        SimpleNamespace(name="refresh_token_web", value=anon, domain=".www.vinted.de", path="/"),
+        SimpleNamespace(name="_ga", value="x", domain=".google.com", path="/"),
+    ]
+
+    async def get_all() -> list:
+        return jar
+
+    client = VintedClient(base_url="https://www.vinted.de", profile_dir=tmp_path)
+    client.browser = SimpleNamespace(cookies=SimpleNamespace(get_all=get_all))
+    cookies = await client._cookies()
+    assert cookies["access_token_web"] == user and "_ga" not in cookies
+    with pytest.raises(Exception, match="nur anonym"):
+        jar[0] = SimpleNamespace(name="access_token_web", value=anon, domain=".vinted.de", path="/")
+        await client.ensure_session()
+
+
+async def test_backfill_skipped_while_session_missing(svc, monkeypatch) -> None:
+    from services.vinted_client import VintedAuthError
+
+    class NoSession(FakeClient):
+        async def ensure_session(self) -> str:
+            raise VintedAuthError("nur anonym")
+
+    calls: list[str] = []
+
+    async def prepare(ka, listings, report):
+        calls.append("prep")
+        return []
+
+    monkeypatch.setattr(svc, "_prepare_backfill", prepare)
+    monkeypatch.setattr(svc, "client", lambda: NoSession())
+    report = await svc.sync([_ka("1", "A")])
+    assert report.auth_required and calls == ["prep"] and svc.auth_required()
+    await svc.sync([_ka("1", "A")])
+    assert calls == ["prep"]
+    monkeypatch.setattr(svc, "client", lambda: FakeClient())
+    await svc.sync([_ka("1", "A")])
+    assert not svc.auth_required()
+
+
+def test_isbn_helpers_and_error_format() -> None:
+    assert vm.normalize_isbn("978-3-16-148410-0") == "9783161484100"
+    assert vm.normalize_isbn("978-3-16-148410-1") is None
+    assert vm.normalize_isbn("0-306-40615-2") == "0306406152"
+    assert vm.find_isbn("Gut erhalten. ISBN 978 3 16 148410 0, Taschenbuch") == "9783161484100"
+    assert vm.find_isbn("Tel 0171 1234567") is None
+    assert vm.needs_isbn("Bücher & andere Medien > Bücher > Sachbücher")
+    body = '{"code":99,"errors":[{"field":"photos","value":"Fehler beim Hochladen"},{"field":"isbn","value":"Bitte gib eine ISBN an"}]}'
+    assert vm.format_validation_errors(body) == "photos: Fehler beim Hochladen; isbn: Bitte gib eine ISBN an"
+    assert vm.pick_color([{"id": 1, "title": "Schwarz"}], "schwarz") == 1
+
+
+def test_to_jpeg_converts_webp() -> None:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (3000, 2000), "red").save(buf, format="WEBP")
+    jpeg = vm.to_jpeg(buf.getvalue())
+    assert jpeg[:3] == b"\xff\xd8\xff"
+    assert max(Image.open(io.BytesIO(jpeg)).size) == vm.JPEG_MAX_SIDE
+
+
+async def test_rejected_bot_draft_is_refilled_not_duplicated(svc, monkeypatch) -> None:
+    import services.openrouter as openrouter
+
+    monkeypatch.setattr(openrouter, "get_text_llm", lambda temperature=0.0: FakeLLM([
+        '{"group": "Damen > Kleidung"}', '{"catalog_id": 100, "condition": "good", "color": "Schwarz"}',
+    ]))
+    await vinted_mapping_repo.save("910020", status="draft", vinted_item_id="90", title="Schlauch H",
+                                   last_error="photos", count_attempt=True)
+    client = FakeClient()
+    updated: list[int] = []
+
+    async def update_draft(draft_id: int, draft: dict, sid: str) -> dict:
+        updated.append(draft_id)
+        return {}
+
+    client.update_draft = update_draft
+    result = await svc.mirror(MirrorInput(
+        ka_listing_id="910020", title="Schlauch H", description="Neu", price=6,
+        images=[b"x"], package_size="S",
+    ), client)
+
+    assert updated == [90] and client.drafts == [] and client.deleted == []
+    assert result.status == "active"
+    assert (await vinted_mapping_repo.get_by_ka("910020"))["status"] == "active"
+
+
+async def test_book_isbn_from_open_library(svc, monkeypatch) -> None:
+    import services.openrouter as openrouter
+
+    monkeypatch.setattr(openrouter, "get_text_llm", lambda temperature=0.0: FakeLLM([
+        '{"group": "Unterhaltung > Bücher"}', '{"catalog_id": 200, "condition": "good", "color": "Schwarz"}',
+    ]))
+
+    import services.vinted_sync as sync_module
+
+    async def lookup(**kwargs) -> tuple:
+        assert kwargs["title"].startswith("Buch:")
+        return "9783161484100", "Katalog (DNB/Open Library)"
+
+    monkeypatch.setattr(sync_module, "find_book_isbn", lookup)
+    monkeypatch.setattr(openrouter, "get_vision_llm", lambda temperature=0.0: None)
+    client = FakeClient()
+    result = await svc.mirror(MirrorInput(
+        ka_listing_id="910021", title="Buch: Gaming revolutioniert die Welt - P", description="Sachbuch",
+        price=8, images=[b"x"], package_size="S",
+    ), client)
+    assert client.drafts[0]["isbn"] == "9783161484100"
+    assert "Katalog" in result.message
+
+
+async def test_missing_isbn_keeps_draft_without_retry(svc, monkeypatch) -> None:
+    import services.openrouter as openrouter
+
+    class IsbnClient(FakeClient):
+        async def complete_draft(self, draft_id: int, draft: dict, sid: str) -> dict:
+            raise VintedApiError("Entwurf veröffentlichen", 422,
+                                 '{"errors":[{"field":"isbn","value":"Bitte gib eine ISBN an"}]}')
+
+    monkeypatch.setattr(openrouter, "get_text_llm", lambda temperature=0.0: FakeLLM([
+        '{"group": "Unterhaltung > Bücher"}', '{"catalog_id": 200, "condition": "good"}',
+    ]))
+
+    import services.vinted_sync as sync_module
+
+    async def lookup(**kwargs) -> tuple:
+        return None, ""
+
+    monkeypatch.setattr(sync_module, "find_book_isbn", lookup)
+    monkeypatch.setattr(openrouter, "get_vision_llm", lambda temperature=0.0: None)
+    result = await svc.mirror(MirrorInput(
+        ka_listing_id="910022", title="Buch: Unbekannt", description="Roman", price=5,
+        images=[b"x"], package_size="S",
+    ), IsbnClient())
+    assert result.status == "draft" and not result.retry and "Vinted-App" in result.message
+    row = await vinted_mapping_repo.get_by_ka("910022")
+    assert row["attempts"] >= 3  # the reconcile step leaves this draft alone
+
+
+async def test_book_gets_language_attribute(svc, monkeypatch) -> None:
+    import services.openrouter as openrouter
+    import services.vinted_sync as sync_module
+
+    monkeypatch.setattr(openrouter, "get_text_llm", lambda temperature=0.0: FakeLLM([
+        '{"group": "Unterhaltung > Bücher"}',
+        '{"catalog_id": 200, "condition": "good", "isbn": "978-3-16-148410-0", "book_language": "Englisch"}',
+    ]))
+    monkeypatch.setattr(openrouter, "get_vision_llm", lambda temperature=0.0: None)
+    client = FakeClient()
+    await svc.mirror(MirrorInput(
+        ka_listing_id="910030", title="Buch: Dune", description="Roman", price=5,
+        images=[b"x"], package_size="S",
+    ), client)
+    attrs = client.drafts[0]["item_attributes"]
+    assert {"code": "language_book", "ids": [6435]} in attrs
+    assert client.drafts[0]["isbn"] == "9783161484100"
+    assert vm.book_language_id(None) == 6437
+
+
+async def test_reset_attempts_reopens_final_drafts(svc) -> None:
+    await vinted_mapping_repo.save("910031", status="draft", vinted_item_id="95", title="X")
+    await vinted_mapping_repo.set_attempts("910031", 3)
+    assert await vinted_mapping_repo.reset_attempts() >= 1
+    assert (await vinted_mapping_repo.get_by_ka("910031"))["attempts"] == 0

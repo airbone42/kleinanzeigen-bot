@@ -181,6 +181,7 @@ ad_defaults:
 | `/logs` | Show the last lines of the kleinanzeigen-bot log |
 | `/vinted` | Vinted mirror status: counts, open drafts, errors |
 | `/vintedsync` | Run the Vinted sync now |
+| `/vintedretry` | Retry rejected Vinted drafts and failed mirrors now (e.g. after an update) |
 | `/vintedlogin <cookie>` | Connect the Vinted session (see [docs/vinted.md](docs/vinted.md)) |
 
 ### Discogs sync

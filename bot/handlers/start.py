@@ -23,6 +23,7 @@ Ich helfe dir dabei, Kleinanzeigen-Inserate automatisch zu erstellen und zu verw
 /vinted – Stand des Vinted-Spiegels
 /vintedsync – Vinted-Abgleich jetzt starten
 /vintedlogin – Vinted-Sitzung verbinden
+/vintedretry – abgelehnte Vinted-Entwürfe neu versuchen
 
 *Neues Inserat erstellen:*
 Schick mir einfach ein oder mehrere Fotos des Artikels (bis zu 10). Ich analysiere die Bilder und erstelle automatisch einen Entwurf mit Titel, Beschreibung und Preisvorschlag.
