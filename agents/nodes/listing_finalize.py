@@ -7,6 +7,8 @@ from models.state import ListingCreatorState
 
 logger = logging.getLogger(__name__)
 
+FALLBACK_TITLE = "Artikel zu verkaufen"
+
 _CONDITION_MAP = {
     "stark gebraucht": "Stark gebrauchter",
     "gebraucht": "Gebrauchter",
@@ -156,6 +158,10 @@ async def finalize_listing(state: ListingCreatorState) -> dict[str, Any]:
     if price <= 0:
         issues.append("Ungültiger Preis")
         price = 1.0
+
+    if title == FALLBACK_TITLE:
+        # Never publish the placeholder: ask the seller for details instead.
+        return {"needs_info": "• Was genau ist das für ein Artikel (Marke, Modell)?"}
 
     if issues:
         logger.warning(f"Draft issues found and fixed: {issues}")

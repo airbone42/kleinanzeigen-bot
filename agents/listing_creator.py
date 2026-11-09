@@ -13,6 +13,13 @@ from agents.nodes.listing_finalize import finalize_listing
 logger = logging.getLogger(__name__)
 
 
+def _route_after_analysis(state: ListingCreatorState) -> list[str]:
+    """Stop the workflow when image analysis needs more input from the seller."""
+    if state.get("needs_info"):
+        return [END]
+    return ["generate_title", "generate_category", "estimate_price"]
+
+
 def build_listing_creator_graph() -> Any:
     """Build the LangGraph state graph for listing creation.
 
@@ -32,9 +39,8 @@ def build_listing_creator_graph() -> Any:
     # Fan-out from image analysis: title/category/price in parallel.
     # Description runs after title so naming/wording can stay consistent with it.
     graph.set_entry_point("analyze_images")
-    graph.add_edge("analyze_images", "generate_title")
-    graph.add_edge("analyze_images", "generate_category")
-    graph.add_edge("analyze_images", "estimate_price")
+    # If the photos are not enough to identify the item, stop and ask instead of guessing.
+    graph.add_conditional_edges("analyze_images", _route_after_analysis)
     graph.add_edge("generate_title", "generate_description")
     # Fan-in barrier: finalize only after all upstream nodes finished.
     graph.add_edge(

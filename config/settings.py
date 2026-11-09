@@ -39,6 +39,10 @@ class Settings(BaseSettings):
         default=Path("./kleinanzeigen-config"),
         description="Path to kleinanzeigen-bot config directory",
     )
+    chromium_path: str = Field(
+        default="",
+        description="Chromium binary for kleinanzeigen-bot (empty: search PATH)",
+    )
     discogs_user_token: str = Field(
         default="",
         description="Discogs user token for inventory sync",
@@ -46,6 +50,29 @@ class Settings(BaseSettings):
     discogs_username: str = Field(
         default="",
         description="Discogs username (owner of the inventory)",
+    )
+
+    # Vinted mirror (off unless VINTED_ENABLED=true; see docs/vinted.md)
+    vinted_enabled: bool = Field(default=False, description="Mirror listings to Vinted")
+    vinted_base_url: str = Field(
+        default="https://www.vinted.de", description="Vinted market (domain decides currency/locale)"
+    )
+    vinted_locale: str = Field(default="de-DE", description="Locale header sent to the Vinted API")
+    vinted_currency: str = Field(default="EUR", description="Currency of the Vinted market")
+    vinted_price_factor: float = Field(
+        default=1.0, gt=0, description="Vinted price = Kleinanzeigen price x factor (rounded)"
+    )
+    vinted_sync_hours: str = Field(
+        default="8,12,16,20",
+        description="Hours (Europe/Berlin) for the sold/removed sync, comma-separated",
+    )
+    vinted_backfill_per_run: int = Field(
+        default=2, ge=0, description="Existing listings mirrored per sync run (0 = no backfill)"
+    )
+    vinted_missing_runs_before_delete: int = Field(
+        default=2,
+        ge=1,
+        description="Sync runs a listing must be missing on Kleinanzeigen before Vinted deletes it",
     )
 
     # Scheduler
@@ -91,6 +118,14 @@ class Settings(BaseSettings):
         if isinstance(v, list):
             return [int(uid) for uid in v]
         return []
+
+    def get_vinted_sync_hours(self) -> list[int]:
+        hours: set[int] = set()
+        for part in self.vinted_sync_hours.split(","):
+            part = part.strip()
+            if part.isdigit() and 0 <= int(part) <= 23:
+                hours.add(int(part))
+        return sorted(hours)
 
     @field_validator("log_level")
     @classmethod

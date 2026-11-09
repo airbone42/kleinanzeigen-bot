@@ -191,12 +191,31 @@ async def _handle_del_confirm(
             await listing_repo.update_status(listing_id, "deleted")
             await q.edit_message_text("🗑️ Anzeige wurde gelöscht.")
             logger.info(f"Listing {listing_id} deleted")
+            await _remove_vinted_twin(q, listing_id)
         else:
             await q.edit_message_text("❌ Löschen fehlgeschlagen. Bitte prüfe Kleinanzeigen manuell.")
 
     except Exception as e:
         logger.error(f"Deletion failed for {listing_id}: {e}", exc_info=True)
         await q.edit_message_text(f"❌ Fehler beim Löschen: {str(e)}")
+
+
+async def _remove_vinted_twin(query: object, listing_id: str) -> None:
+    """Delete the Vinted copy too, instead of waiting for the next sync."""
+    from config.settings import settings
+
+    if not settings.vinted_enabled:
+        return
+    from telegram import CallbackQuery
+    q: CallbackQuery = query  # type: ignore[assignment]
+    try:
+        from services.vinted_sync import VintedSyncService
+        note = await VintedSyncService().remove_for_ka(listing_id)
+    except Exception as e:
+        logger.error(f"Vinted delete for {listing_id} failed: {e}", exc_info=True)
+        note = f"Vinted-Löschen fehlgeschlagen ({e}), der nächste Abgleich versucht es erneut"
+    if note and q.message is not None:
+        await q.message.reply_text(f"👗 {note}")  # type: ignore[union-attr]
 
 
 async def _handle_del_skip(query: object, listing_id: str) -> None:
@@ -220,7 +239,11 @@ async def text_message_handler(
 
     user_state = _user_states.get(chat_id)
     if not user_state:
-        return  # No active state – ignore
+        # Possibly the answer to a question about unrecognized photos.
+        from bot.handlers.new_listing import consume_pending_info
+
+        await consume_pending_info(context, chat_id, text)
+        return
 
     action = str(user_state.get("action", ""))
     listing_id = user_state.get("listing_id")

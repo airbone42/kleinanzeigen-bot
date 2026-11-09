@@ -6,10 +6,13 @@ The bot maps an ad's ``category`` to a numeric path via its bundled
 nothing, the shipping section never renders and publishing dies with
 "No HTML element found with ID 'ad-shipping-options'".
 
-Downloaded ads carry the leaf name only (e.g. "Bücher & Zeitschriften"), so
-every category we write into an ad YAML goes through :func:`resolve_category`.
+Older downloads carried the leaf name only (e.g. "Bücher & Zeitschriften"),
+the pinned bot downloads the numeric path (e.g. "73/77" or
+"161/172/lautsprecher_kopfhoerer"), so every category we write into an ad YAML
+goes through :func:`resolve_category`.
 """
 import logging
+import re
 from functools import lru_cache
 from typing import Optional
 
@@ -64,6 +67,8 @@ CATEGORY_LIST: list[str] = [
 # Catch-all for items that fit nowhere else.
 DEFAULT_CATEGORY = "Freizeit, Hobby & Nachbarschaft > Trödel"
 
+_NUMERIC_PATH = re.compile(r"^\d+/\d+(/[a-z0-9_]+)?$")
+
 
 @lru_cache(maxsize=1)
 def known_categories() -> dict[str, str]:
@@ -94,6 +99,13 @@ def resolve_category(value: Optional[str]) -> Optional[str]:
     categories = known_categories()
     if candidate in categories:
         return candidate
+    # Numeric path as written by the bot's download: the bot passes it verbatim
+    # into the category URL. A third segment is an optional subcategory.
+    if _NUMERIC_PATH.match(candidate):
+        known_paths = set(categories.values())
+        if candidate in known_paths or "/".join(candidate.split("/")[:2]) in known_paths:
+            return candidate
+        return None
     # The bot itself falls back to the parent path, so such values are fine.
     if ">" in candidate and candidate.rpartition(">")[0].strip() in categories:
         return candidate

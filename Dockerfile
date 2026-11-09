@@ -1,8 +1,12 @@
 FROM python:3.12-slim-bookworm
 
-# git is required for the kleinanzeigen-bot pip dependency (installed from GitHub)
-RUN apt-get update && apt-get install -y --no-install-recommends git xvfb && \
+# git is required for the kleinanzeigen-bot pip dependency (installed from GitHub).
+# Chromium is the Debian package (bookworm, security updates via debian-security / LTS,
+# e.g. DLA-4878-1), not Playwright's bundled build, which stays frozen at the Playwright
+# release (Vikunja #352). Rebuild the image to pick up Chromium updates.
+RUN apt-get update && apt-get install -y --no-install-recommends git xvfb chromium fonts-dejavu-core && \
     rm -rf /var/lib/apt/lists/*
+ENV CHROMIUM_PATH=/usr/bin/chromium
 
 WORKDIR /app
 
@@ -24,13 +28,8 @@ COPY scripts/ scripts/
 # Without it every XPath lookup fails with CDP -32601 and publishing breaks.
 RUN pip install --no-cache-dir -e .[test] && python scripts/fix_nodriver.py
 
-# Install Playwright system dependencies and Chromium binary into /opt/playwright.
-# Using a fixed path (instead of /root/.cache) keeps it consistent regardless of which
-# user runs the container, and avoids conflicts with volume-mounted directories.
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 # DISPLAY must be an ENV (not just exported in entrypoint) so docker exec sessions inherit it
 ENV DISPLAY=:99
-RUN playwright install-deps chromium && playwright install chromium
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh

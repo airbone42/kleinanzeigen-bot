@@ -20,6 +20,9 @@ Ich helfe dir dabei, Kleinanzeigen-Inserate automatisch zu erstellen und zu verw
 /discogssync – Discogs-Inventar mit Kleinanzeigen synchronisieren
 /diagnose – Browser-Diagnose (Troubleshooting)
 /logs – Letzte Zeilen des Kleinanzeigen-Logs anzeigen
+/vinted – Stand des Vinted-Spiegels
+/vintedsync – Vinted-Abgleich jetzt starten
+/vintedlogin – Vinted-Sitzung verbinden
 
 *Neues Inserat erstellen:*
 Schick mir einfach ein oder mehrere Fotos des Artikels (bis zu 10). Ich analysiere die Bilder und erstelle automatisch einen Entwurf mit Titel, Beschreibung und Preisvorschlag.
@@ -29,7 +32,7 @@ Schick mir einfach ein oder mehrere Fotos des Artikels (bis zu 10). Ich analysie
 • ✍️ Titel und Beschreibungstext auf Knopfdruck
 • 💰 Intelligente Preisschätzung
 • 🔄 Täglicher Check für ablaufende Anzeigen
-• ✅ Alles immer zuerst als Entwurf – du hast das letzte Wort!
+• 👗 Optional: Spiegel auf Vinted, verkauft auf einer Plattform = weg auf der anderen
 """
 
 START_TEXT = """

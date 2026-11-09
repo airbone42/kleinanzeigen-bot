@@ -2,8 +2,9 @@
 import asyncio
 import logging
 import os
+import shutil
 import signal
-import subprocess
+import socket
 import sys
 from typing import Optional
 
@@ -23,41 +24,79 @@ from bot.handlers.start import start_handler, help_handler
 logger = logging.getLogger(__name__)
 
 
+# --no-sandbox alone does not disable the separately sandboxed network service, which
+# made fetch() fail inside Docker (ExceptionDetails: Failed to fetch), hence the last two.
+SANDBOX_FLAGS = (
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-network-service-sandbox",
+    "--disable-features=NetworkServiceSandbox",
+)
+CHROMIUM_CANDIDATES = ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable")
+
+
+def _find_chromium() -> Optional[str]:
+    """Locate a system Chromium binary (CHROMIUM_PATH wins over PATH lookup)."""
+    if settings.chromium_path:
+        return settings.chromium_path if os.path.exists(settings.chromium_path) else None
+    for name in CHROMIUM_CANDIDATES:
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _clear_stale_profile_lock(profile_dir: "os.PathLike[str]") -> None:
+    """Remove Chromium's Singleton* lock files if they belong to a dead or foreign process.
+
+    Chromium refuses a profile whose SingletonLock (symlink "<hostname>-<pid>") points to
+    another host ("profile in use on another computer") and nodriver then only reports
+    "Failed to connect to browser". Happens after moving the profile (Docker VM -> CT 202)
+    or after a crash. Runs at bot start, before any browser of this bot is up.
+    """
+    lock = os.path.join(profile_dir, "SingletonLock")
+    try:
+        target = os.readlink(lock)
+    except OSError:
+        return  # no lock
+    host, _, pid = target.rpartition("-")
+    alive = False
+    if host == socket.gethostname() and pid.isdigit():
+        try:
+            os.kill(int(pid), 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True  # exists, owned by someone else
+    if alive:
+        return
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        try:
+            os.unlink(os.path.join(profile_dir, name))
+        except FileNotFoundError:
+            pass
+    logger.warning(f"Removed stale Chromium profile lock ({target}) in {profile_dir}")
+
+
 def _setup_browser() -> None:
-    """Install Playwright Chromium and configure kleinanzeigen-bot to use it.
+    """Configure kleinanzeigen-bot to use a Chromium binary.
 
     kleinanzeigen-bot uses nodriver (Chrome DevTools Protocol) and needs a real
-    Chrome/Chromium binary. We use Playwright's managed Chromium as the binary source,
-    then write its path into kleinanzeigen-config/config.yaml so nodriver finds it.
+    Chrome/Chromium binary: CHROMIUM_PATH or the first one in PATH, in CT 202 and in the
+    Docker image the Debian package `chromium` (security updates via apt, visible to
+    secwatch). Playwright's bundled Chromium is no longer used: it stays frozen at the
+    Playwright release (Vikunja #352). The path goes into kleinanzeigen-config/config.yaml.
     """
     import yaml
 
     logger.info("Setting up browser for kleinanzeigen-bot...")
     try:
-        # Step 1: install/update Playwright Chromium binary (idempotent)
-        result = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode != 0:
-            logger.error(f"playwright install chromium failed: {result.stderr[:500]}")
+        chromium_path = _find_chromium()
+        if not chromium_path:
+            logger.error("No Chromium found (CHROMIUM_PATH or PATH), install the package chromium")
             return
-
-        # Step 2: get the Chromium executable path via a subprocess (sync_playwright()
-        # cannot be called inside an asyncio loop, so we use a child process)
-        path_result = subprocess.run(
-            [sys.executable, "-c",
-             "from playwright.sync_api import sync_playwright\n"
-             "with sync_playwright() as pw: print(pw.chromium.executable_path)"],
-            capture_output=True, text=True, timeout=30,
-        )
-        chromium_path = path_result.stdout.strip()
-
-        if not chromium_path or not os.path.exists(chromium_path):
-            logger.error(f"Playwright Chromium binary not found at: {chromium_path}")
-            return
-
-        logger.info(f"Playwright Chromium ready at: {chromium_path}")
+        logger.info(f"Using Chromium at: {chromium_path}")
 
         # Step 3: write binary_location + headless args into kleinanzeigen config.yaml
         config_file = settings.kleinanzeigen_config_path / "config.yaml"
@@ -74,7 +113,7 @@ def _setup_browser() -> None:
         # --incognito and prevents cookie persistence → GDPR overlay → login timeout.
         browser_cfg["use_private_window"] = False
 
-        # Docker/root-safe flags (idempotent – only added if missing).
+        # Browser flags (idempotent – only added if missing).
         # kleinanzeigen-bot explicitly handles --no-sandbox (web_scraping_mixin.py:563).
         args: list[str] = browser_cfg.get("arguments", [])
         # Strip flags that are known-bad or obsolete:
@@ -83,17 +122,17 @@ def _setup_browser() -> None:
         #   --disable-network-service-sandbox which is the correct modern fix
         _strip = {"--headless", "--enable-features=NetworkServiceInProcess", "--incognito"}
         args = [a for a in args if a not in _strip]
+        # Chrome refuses its sandbox as root, so sandbox flags are only set when running
+        # as root (Docker). As an unprivileged service user (CT 202) the sandbox stays on
+        # and stale flags are removed. os.geteuid does not exist on Windows.
+        if getattr(os, "geteuid", lambda: -1)() == 0:
+            logger.warning("Running as root: Chromium sandbox disabled")
+            args.extend(flag for flag in SANDBOX_FLAGS if flag not in args)
+        else:
+            args = [a for a in args if a not in SANDBOX_FLAGS]
         for flag in [
             "--disable-gpu",
             "--disable-dev-shm-usage",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            # The network service runs in a separate sandboxed process; --no-sandbox
-            # alone does not disable it, causing fetch() to fail inside Docker
-            # (ExceptionDetails: Failed to fetch).
-            "--disable-network-service-sandbox",
-            # Belt-and-suspenders: also disable via feature flag for Chrome 136+
-            "--disable-features=NetworkServiceSandbox",
             # Suppress the navigator.webdriver flag that Cloudflare / bot-detection
             # services check; prevents the login-state selector timeout caused by a
             # challenge or GDPR-consent page being served instead of the real page.
@@ -104,7 +143,9 @@ def _setup_browser() -> None:
         browser_cfg["arguments"] = args
 
         # Persist browser profile between restarts (uses setdefault so user can override in config.yaml)
-        browser_cfg["user_data_dir"] = str(settings.kleinanzeigen_config_path.resolve() / "browser-profile")
+        profile_dir = settings.kleinanzeigen_config_path.resolve() / "browser-profile"
+        browser_cfg["user_data_dir"] = str(profile_dir)
+        _clear_stale_profile_lock(profile_dir)
 
         # Page loads on kleinanzeigen.de take ~40s in this container (headless Chromium,
         # cold cache); the upstream default page_load timeout of 15s makes login fail with
@@ -186,6 +227,7 @@ async def build_application() -> Application:
     from bot.handlers.discogs_sync import discogs_sync_handler
     from bot.handlers.diagnose import diagnose_handler
     from bot.handlers.logs import logs_handler
+    from bot.handlers.vinted import vinted_login_handler, vinted_status_handler, vinted_sync_handler
 
     app = Application.builder().token(settings.telegram_bot_token).build()
 
@@ -209,6 +251,9 @@ async def build_application() -> Application:
     app.add_handler(CommandHandler("discogssync", discogs_sync_handler, filters=user_f))
     app.add_handler(CommandHandler("diagnose", diagnose_handler, filters=user_f))
     app.add_handler(CommandHandler("logs", logs_handler, filters=user_f))
+    app.add_handler(CommandHandler("vinted", vinted_status_handler, filters=user_f))
+    app.add_handler(CommandHandler("vintedsync", vinted_sync_handler, filters=user_f))
+    app.add_handler(CommandHandler("vintedlogin", vinted_login_handler, filters=user_f))
 
     # Photo handler (for new listings)
     app.add_handler(MessageHandler(filters.PHOTO & user_f, photo_handler))

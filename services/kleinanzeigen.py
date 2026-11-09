@@ -31,16 +31,20 @@ CLI commands:
 Note: --ads no longer accepts file paths (changed in 2026+9baba41).
 """
 import asyncio
+import html
 import logging
 import os
 import re
 import shutil
+import signal
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
+import httpx
 import yaml
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -62,18 +66,29 @@ DEFAULT_REPUBLICATION_INTERVAL = 60
 ADS_DIR_NAME = "ads"
 # Download directory used by `kleinanzeigen-bot download`
 DOWNLOADED_ADS_DIR_NAME = "downloaded-ads"
+# Persistent per-listing image copies; survives download-dir wipes and republishes
+IMAGE_ARCHIVE_DIR_NAME = "image-archive"
+DISCOGS_USER_AGENT = "kleinanzeigen-telegram-bot/0.1"
+IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 # Config file name
 CONFIG_FILE_NAME = "config.yaml"
 # Timeout for single-ad download operations (seconds)
 DOWNLOAD_SINGLE_TIMEOUT = 300
+DOWNLOAD_SINGLE_ATTEMPTS = 2
 # Timeout for publish --ads new (seconds)
 PUBLISH_NEW_TIMEOUT = 900
 # Environment/setup warnings the bot emits regardless of the actual failure.
 BOT_NOISE_WARNING_RE = re.compile(r"nodriver CDP re-attach patch not found")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+BOT_BATCH_ERROR_RE = re.compile(r"\[ERROR\]\s*Traceback|AdBatchError|Failed to publish \d+ ad")
 
 # Retry behaviour for the published-ads API (in-page fetch fails sporadically)
 PUBLISHED_ADS_FETCH_ATTEMPTS = 3
 PUBLISHED_ADS_RETRY_DELAY = 3
+# Submit-boundary recovery: poll published-ads metadata for the new ad
+# New ads show up in the manage-ads JSON with a delay of several minutes (moderation),
+# so poll with growing gaps (~7 min in total) before concluding nothing was published.
+RECOVERY_LOOKUP_DELAYS = (20, 40, 60, 120, 180)
 PUBLISHED_ADS_MAX_PAGES = 100
 
 
@@ -149,6 +164,7 @@ class KleinanzeigenService:
         self.config_file = self.config_path / CONFIG_FILE_NAME
         self.ads_dir = self.config_path / ADS_DIR_NAME
         self.downloaded_ads_dir = self.config_path / DOWNLOADED_ADS_DIR_NAME
+        self.image_archive_dir = self.config_path / IMAGE_ARCHIVE_DIR_NAME
         self.ads_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_cli_command(self) -> list[str]:
@@ -173,6 +189,41 @@ class KleinanzeigenService:
             except Exception:
                 pass
 
+    def _kill_orphan_browsers(self) -> None:
+        """Kill Chromium processes still holding the bot's browser profile.
+
+        When nodriver fails to connect (e.g. a slow start) it leaves the launched Chromium
+        running. That orphan keeps the profile's SingletonLock, every later launch just
+        hands over to it, never opens a debug port and fails with "Failed to connect to
+        browser" until the service restarts (daily check broken 27.10.2026). The bot runs
+        one browser at a time, so anything on this profile at session start is stale.
+        Linux only (/proc), a no-op elsewhere.
+        """
+        marker = f"--user-data-dir={(self.config_path / 'browser-profile').resolve()}".encode()
+        proc = Path("/proc")
+        if not proc.is_dir():
+            return
+        victims = []
+        for entry in proc.iterdir():
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if marker in cmdline:
+                victims.append(int(entry.name))
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in victims:
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    pass
+            if sig == signal.SIGTERM and victims:
+                time.sleep(2)
+        if victims:
+            logger.warning("Killed %d orphan Chromium process(es) on the browser profile", len(victims))
+
     def _clear_browser_profile(self) -> None:
         """Delete the entire browser profile to force a completely fresh session."""
         browser_profile = self.config_path / "browser-profile"
@@ -187,6 +238,7 @@ class KleinanzeigenService:
         that prevent the next Chromium instance from starting. We clear them
         proactively so the CLI can always start a fresh session.
         """
+        self._kill_orphan_browsers()
         self._clear_browser_locks()
 
     async def _run_cli(
@@ -226,6 +278,9 @@ class KleinanzeigenService:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self.config_path),
                 env=env,
+                # Own process group, so a timeout kill also reaches the Chromium
+                # child; otherwise it survives orphaned and keeps the profile locked.
+                start_new_session=True,
             )
             if timeout is None:
                 stdout_b, stderr_b = await proc.communicate()
@@ -246,7 +301,10 @@ class KleinanzeigenService:
 
         except asyncio.TimeoutError:
             try:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 try:
                     partial_out, partial_err = await asyncio.wait_for(proc.communicate(), timeout=5)
                     partial = (partial_err.decode("utf-8", errors="replace") + "\n" +
@@ -424,12 +482,32 @@ class KleinanzeigenService:
             bot.config_file_path = str(bot.workspace.config_file)
             bot.log_file_path = str(bot.workspace.log_file) if bot.workspace.log_file else None
         bot._bootstrap_runtime()
+        await self._pre_session_setup()
         try:
-            await bot.create_browser_session()
+            await self._create_browser_session_with_retry(bot)
             await bot.login()
             return await self._fetch_published_ads_resilient(bot)
         finally:
             await bot.close_browser_session()
+
+    async def _create_browser_session_with_retry(self, bot, attempts: int = 3) -> None:
+        """Start the browser, retrying when nodriver gives up on a slow cold start.
+
+        nodriver waits only ~3 s for the debug port. After an idle night Chromium 156
+        on the small CT needs longer, nodriver raises "Failed to connect to browser"
+        and leaves the started Chromium behind (daily check 1.11.2026 6:00). Kill the
+        leftover and start again; the second start is warm.
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                await bot.create_browser_session()
+                return
+            except Exception as e:
+                if attempt == attempts:
+                    raise
+                logger.warning(f"Browser start failed (attempt {attempt}/{attempts}): {e}")
+                self._kill_orphan_browsers()
+                await asyncio.sleep(5)
 
     async def _fetch_published_ads_resilient(self, bot) -> list[dict]:
         """Fetch published ads with retries and a navigation-based fallback.
@@ -644,6 +722,11 @@ class KleinanzeigenService:
                 except Exception as url_err:
                     logger.debug(f"Could not read id from YAML: {url_err}")
 
+            # Keep the photos for later republishes and the Vinted mirror.
+            new_id = re.search(r"(\d{6,})", listing_url or "")
+            if new_id and images:
+                self._archive_listing_images(new_id.group(1), ad_dir / "images")
+
             # Clean up local ad files – the listing is now live on Kleinanzeigen.
             shutil.rmtree(ad_dir, ignore_errors=True)
             logger.debug(f"Cleaned up ad dir after publish: {ad_dir}")
@@ -668,9 +751,10 @@ class KleinanzeigenService:
     def _sanitize_ad_yaml(data: dict) -> dict:
         """Drop unsupported keys and canonicalize the category.
 
-        Downloaded ads carry the leaf category name only ("Bücher & Zeitschriften"),
-        which the bot cannot resolve: it then opens the category page with the raw
-        name, nothing gets selected and the shipping section never renders.
+        Downloaded ads carry a leaf name ("Bücher & Zeitschriften", older downloads)
+        or a numeric path ("73/77"). Unresolvable names make the bot open the
+        category page with the raw value, nothing gets selected and the shipping
+        section never renders.
         """
         clean = {k: v for k, v in data.items() if k in KleinanzeigenService._ALLOWED_AD_FIELDS}
         if "category" in clean:
@@ -703,10 +787,14 @@ class KleinanzeigenService:
         (e.g. the nodriver patch hint) long before the actual failure, and showing
         those instead of the real cause makes the message useless.
         """
-        lines = output.splitlines()
+        lines = ANSI_ESCAPE_RE.sub("", output).splitlines()
         errors: list[str] = []
         warnings: list[str] = []
         for idx, line in enumerate(lines):
+            # Since upstream #1285 a failed batch ends with a generic AdBatchError
+            # traceback; the specific cause is in the lines before it.
+            if BOT_BATCH_ERROR_RE.search(line):
+                continue
             if re.search(r"\[ERROR\]|All \d+ attempts failed|CaptchaEncountered", line):
                 errors.append(self._with_error_details(lines, idx))
             elif "[WARNING]" in line and not BOT_NOISE_WARNING_RE.search(line):
@@ -743,7 +831,11 @@ class KleinanzeigenService:
 
     def _extract_listing_id(self, output: str) -> Optional[str]:
         """Extract Kleinanzeigen listing ID from CLI output."""
-        match = re.search(r'/(\d{7,12})', output)
+        match = re.search(r'ad published with ID (\d{7,12})|[?&]adId=(\d{7,12})', output)
+        if match:
+            return match.group(1) or match.group(2)
+        # Drop DevTools URLs (ws://.../browser/<uuid>) – a UUID can start with 8 digits
+        match = re.search(r'/(\d{7,12})', re.sub(r'wss?://\S+', '', output))
         if match:
             return match.group(1)
         return None
@@ -1195,10 +1287,15 @@ class KleinanzeigenService:
             """
             return "Andere Versandmethoden" in output or "ad-shipping-options" in output
 
+        def _may_be_live(output: str) -> bool:
+            """True when the bot clicked submit; any further retry risks a duplicate ad."""
+            return bool(re.search(r"submission may have succeeded|reached submit boundary", output, re.IGNORECASE))
+
         pickup_warning: Optional[str] = None
 
         # If shipping dialog failed, try 3 alternative categories, then fall back to PICKUP
-        if (returncode != 0 or re.search(r"published 0 ads", combined_output, re.IGNORECASE)) and _shipping_dialog_failed(combined_output):
+        if (returncode != 0 or re.search(r"published 0 ads", combined_output, re.IGNORECASE)) \
+                and _shipping_dialog_failed(combined_output) and not _may_be_live(combined_output):
             with open(new_yaml, encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
 
@@ -1234,6 +1331,13 @@ class KleinanzeigenService:
                 if returncode == 0 and not re.search(r"published 0 ads", combined_output, re.IGNORECASE):
                     published = True
                     break
+                if _may_be_live(combined_output):
+                    logger.warning(
+                        "Category retry for listing %s reached submit boundary; stopping retries "
+                        "to avoid duplicate ads.", listing_id,
+                    )
+                    published = True
+                    break
 
             if not published:
                 logger.warning(
@@ -1259,7 +1363,8 @@ class KleinanzeigenService:
 
         # Special-attribute retry: if a category-specific attribute field can't be found, strip it and retry
         if (returncode != 0 or re.search(r"published 0 ads", combined_output, re.IGNORECASE)) \
-                and re.search(r"Failed to set attribute '(.+?)'", combined_output):
+                and re.search(r"Failed to set attribute '(.+?)'", combined_output) \
+                and not _may_be_live(combined_output):
             attr_match = re.search(r"Failed to set attribute '(.+?)'", combined_output)
             logger.warning(
                 "Special attribute '%s' not found for listing %s; stripping special_attributes and retrying.",
@@ -1279,7 +1384,8 @@ class KleinanzeigenService:
         # Stale page retry: if pstad-descrptn specifically never rendered, retry once with fresh lock cleanup
         # NOTE: Do NOT clear the full browser profile here — that destroys auth cookies and triggers 2FA.
         if (returncode != 0 or re.search(r"published 0 ads", combined_output, re.IGNORECASE)) \
-                and re.search(r"No HTML element found with ID .pstad-descrptn.", combined_output):
+                and re.search(r"No HTML element found with ID .pstad-descrptn.", combined_output) \
+                and not _may_be_live(combined_output):
             logger.warning(
                 "Stale browser page (pstad-descrptn) for listing %s; retrying once.", listing_id,
             )
@@ -1289,7 +1395,7 @@ class KleinanzeigenService:
             )
             combined_output = stdout + stderr
 
-        if returncode != 0:
+        if returncode != 0 and not _may_be_live(combined_output):
             # If the publish bot internally calls delete_ad and THAT times out, the publish
             # may have succeeded even though the CLI exits non-zero. Try to recover via YAML id.
             if "delete_ad" in combined_output or "meine-anzeigen" in combined_output:
@@ -1308,11 +1414,13 @@ class KleinanzeigenService:
                         "(Timeout beim Laden von 'Meine Anzeigen'). Bitte manuell entfernen.",
                     )
             shutil.rmtree(new_ad_dir, ignore_errors=True)
-            raise KleinanzeigenError(f"Veröffentlichung fehlgeschlagen: {combined_output[-600:]}")
+            raise KleinanzeigenError(
+                f"Veröffentlichung fehlgeschlagen: {self._extract_bot_error(combined_output)}\n(Details: /logs)"
+            )
 
         # Submit-boundary: bot clicked submit but couldn't confirm success (stale page / renamed DOM).
         # The bot writes the new ID back into the YAML on success — check that first.
-        if re.search(r"submission may have succeeded|reached submit boundary", combined_output, re.IGNORECASE):
+        if _may_be_live(combined_output):
             new_id = self._extract_listing_id_from_yaml(new_yaml)
             if new_id:
                 # Bot confirmed success via YAML — treat as normal publish
@@ -1333,14 +1441,10 @@ class KleinanzeigenService:
                 with open(new_yaml, encoding="utf-8") as _f:
                     _yaml_data = yaml.safe_load(_f) or {}
                 _ad_title = _yaml_data.get("title", "")
-                await asyncio.sleep(8)  # wait for the new ad to appear on the server
-                live_listings = await self.get_active_listings(refresh=True)
-                matched = [
-                    lv for lv in live_listings
-                    if lv.title == _ad_title and lv.listing_id != listing_id
-                ]
-                if matched:
-                    recovered_id = matched[0].listing_id
+                recovered_id, old_still_live = await self._find_new_listing_id_by_title(
+                    _ad_title, listing_id
+                )
+                if recovered_id:
                     recovered_url = f"https://www.kleinanzeigen.de/s-anzeige/id/{recovered_id}"
                     logger.info(
                         "Submit boundary auto-recovery succeeded for listing %s — new id=%s.",
@@ -1350,9 +1454,30 @@ class KleinanzeigenService:
                     await self.delete_listing(listing_id)
                     return recovered_url, pickup_warning
                 logger.warning(
-                    "Submit boundary auto-recovery: no matching live ad found for title '%s' (listing %s).",
-                    _ad_title, listing_id,
+                    "Submit boundary auto-recovery: no matching live ad found for title '%s' "
+                    "(listing %s, old still live=%s).",
+                    _ad_title, listing_id, old_still_live,
                 )
+                if old_still_live:
+                    # Nothing new showed up within the polling window and the original is still
+                    # listed. The new ad may still appear late, so don't claim it wasn't published.
+                    shutil.rmtree(new_ad_dir, ignore_errors=True)
+                    raise KleinanzeigenError(
+                        "Neue Anzeige konnte nach dem Absenden nicht bestätigt werden (bisher nicht unter "
+                        "'Meine Anzeigen' sichtbar – Kleinanzeigen zeigt neue Anzeigen teils verzögert). "
+                        f"Alte Anzeige {listing_id} wurde NICHT gelöscht. Bitte prüfen und ggf. eine "
+                        "der beiden manuell löschen.\n(Details: /logs)"
+                    )
+                if old_still_live is False:
+                    shutil.rmtree(new_ad_dir, ignore_errors=True)
+                    return (
+                        "Anzeige konnte nach dem Absenden nicht bestätigt werden. "
+                        "Bitte unter 'Meine Anzeigen' prüfen.",
+                        f"⚠️ Alte Anzeige {listing_id} ist nicht mehr online und die neue Anzeige "
+                        "wurde nicht gefunden. Bitte 'Meine Anzeigen' prüfen.",
+                    )
+            except KleinanzeigenError:
+                raise
             except Exception as recovery_err:
                 logger.warning(
                     "Submit boundary auto-recovery failed for listing %s: %s",
@@ -1495,7 +1620,7 @@ class KleinanzeigenService:
                 if existing_dir.is_dir() and existing_dir.name.startswith("ad_") and existing_dir != new_ad_dir:
                     shutil.rmtree(existing_dir, ignore_errors=True)
 
-            return await self._publish_new_ad(new_ad_dir, new_yaml, listing_id)
+            return await self._publish_with_images(new_ad_dir, new_yaml, listing_id)
 
         source_dir = source_yaml.parent
         ad_id = str(uuid.uuid4())[:8]
@@ -1533,7 +1658,159 @@ class KleinanzeigenService:
             if existing_dir.is_dir() and existing_dir.name.startswith("ad_") and existing_dir != new_ad_dir:
                 shutil.rmtree(existing_dir, ignore_errors=True)
 
-        return await self._publish_new_ad(new_ad_dir, new_yaml, listing_id)
+        return await self._publish_with_images(new_ad_dir, new_yaml, listing_id)
+
+    async def _find_new_listing_id_by_title(
+        self, title: str, old_listing_id: str
+    ) -> tuple[Optional[str], Optional[bool]]:
+        """Find a freshly posted ad by title via the published-ads metadata.
+
+        Cheap compared to a full `download` (which re-scrapes every ad page and
+        aborts on any single page error); polled because new ads show up with delay.
+
+        Returns (new_id, old_still_live); old_still_live is None when no lookup succeeded.
+        """
+        wanted = html.unescape(title).strip()
+        old_still_live: Optional[bool] = None
+        for attempt, delay in enumerate(RECOVERY_LOOKUP_DELAYS, start=1):
+            await asyncio.sleep(delay)
+            try:
+                ads = await self._fetch_published_ads_raw()
+            except Exception as e:
+                logger.warning(f"Recovery lookup failed (attempt {attempt}): {e}")
+                continue
+            old_still_live = any(str(ad.get("id") or "") == str(old_listing_id) for ad in ads)
+            for ad in ads:
+                ad_id = str(ad.get("id") or "")
+                if ad_id and ad_id != str(old_listing_id) \
+                        and html.unescape(str(ad.get("title") or "")).strip() == wanted:
+                    return ad_id, old_still_live
+        return None, old_still_live
+
+    async def _publish_with_images(
+        self, new_ad_dir: Path, new_yaml: Path, listing_id: str
+    ) -> tuple[str, Optional[str]]:
+        """Publish the prepared ad after making sure its images survived the download.
+
+        `kleinanzeigen-bot download` sporadically reports "No image area found" and
+        exits 0, which used to republish the ad without photos and delete the original.
+        """
+        with open(new_yaml, encoding="utf-8") as f:
+            title = str((yaml.safe_load(f) or {}).get("title") or "")
+        from db.repository import discogs_mapping_repo
+        mapping = await discogs_mapping_repo.find_for_listing(listing_id, title)
+
+        if not await self._ensure_ad_images(listing_id, new_ad_dir, new_yaml, mapping):
+            shutil.rmtree(new_ad_dir, ignore_errors=True)
+            raise KleinanzeigenError(
+                f"Keine Bilder für Anzeige {listing_id} gefunden (Download lieferte 0 Bilder). "
+                "Erneuerung abgebrochen – die bisherige Anzeige bleibt online."
+            )
+        new_url, warning = await self._publish_new_ad(new_ad_dir, new_yaml, listing_id)
+        new_id_match = re.match(r"(\d{6,})", new_url.rstrip("/").rsplit("/", 1)[-1])
+        if new_id_match:
+            new_id = new_id_match.group(1)
+            self._move_image_archive(listing_id, new_id)
+            if mapping is not None:
+                await discogs_mapping_repo.set_listing_id(int(mapping["id"]), new_id, new_url)
+                logger.info(f"Discogs mapping {mapping['discogs_release_id']} now points to listing {new_id}")
+            try:
+                from services.vinted_sync import VintedSyncService
+                await VintedSyncService().follow_republish(listing_id, new_id, title)
+            except Exception as e:
+                logger.error(f"Vinted mapping could not follow republish {listing_id} -> {new_id}: {e}")
+        return new_url, warning
+
+    @staticmethod
+    def _image_files(directory: Path) -> list[Path]:
+        if not directory.is_dir():
+            return []
+        return sorted(
+            f for f in directory.rglob("*")
+            if f.is_file() and f.suffix.lower() in IMAGE_SUFFIXES
+        )
+
+    def _archive_listing_images(self, listing_id: str, source_dir: Path) -> int:
+        """Snapshot the listing's images; never overwrites an archive with nothing."""
+        images = self._image_files(source_dir)
+        if not images:
+            return 0
+        target = self.image_archive_dir / str(listing_id)
+        shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True, exist_ok=True)
+        for img in images:
+            shutil.copy2(img, target / img.name)
+        logger.info(f"Archived {len(images)} image(s) for listing {listing_id}")
+        return len(images)
+
+    def _move_image_archive(self, old_id: str, new_id: str) -> None:
+        source = self.image_archive_dir / str(old_id)
+        if not source.is_dir():
+            return
+        target = self.image_archive_dir / str(new_id)
+        shutil.rmtree(target, ignore_errors=True)
+        source.rename(target)
+
+    def _restore_images_from_archive(self, listing_id: str, new_ad_dir: Path, new_yaml: Path) -> int:
+        images = self._image_files(self.image_archive_dir / str(listing_id))
+        if not images:
+            return 0
+        for img in images:
+            shutil.copy2(img, new_ad_dir / img.name)
+        with open(new_yaml, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        data["images"] = [img.name for img in images]
+        with open(new_yaml, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+        return len(images)
+
+    async def _ensure_ad_images(
+        self, listing_id: str, new_ad_dir: Path, new_yaml: Path, mapping: Optional[Mapping[str, Any]] = None
+    ) -> bool:
+        """Make sure the ad to republish carries its images.
+
+        Order: images already in the copied dir → retry the download once →
+        archived images → Discogs cover for Discogs-synced ads. Returns False
+        when no image could be found, so the caller keeps the old ad.
+        """
+        if self._archive_listing_images(listing_id, new_ad_dir):
+            return True
+
+        if not self._image_files(self.image_archive_dir / str(listing_id)):
+            logger.warning(f"No images for listing {listing_id} after download; retrying download once")
+            try:
+                await self.download_single_listing(listing_id)
+            except Exception as e:
+                logger.warning(f"Image retry download failed for {listing_id}: {e}")
+
+        if not self._image_files(self.image_archive_dir / str(listing_id)) and mapping is not None:
+            if await self._archive_discogs_cover(listing_id, str(mapping["image_url"] or "")):
+                logger.warning(f"Using Discogs cover as image for listing {listing_id}")
+
+        restored = self._restore_images_from_archive(listing_id, new_ad_dir, new_yaml)
+        if restored:
+            logger.warning(f"Restored {restored} archived image(s) for listing {listing_id}")
+            return True
+
+        logger.error(f"No images for listing {listing_id} – keeping the old ad")
+        return False
+
+    async def _archive_discogs_cover(self, listing_id: str, image_url: str) -> bool:
+        if not image_url:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=20, headers={"User-Agent": DISCOGS_USER_AGENT}) as client:
+                response = await client.get(image_url)
+                response.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Discogs cover download failed for {listing_id}: {e}")
+            return False
+        if not response.content or "image" not in response.headers.get("content-type", "image").lower():
+            return False
+        target = self.image_archive_dir / str(listing_id)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "discogs_cover.jpg").write_bytes(response.content)
+        return True
 
     async def get_listing_details(self, listing_id: str) -> Optional[Listing]:
         """Get details of a specific listing.
@@ -1574,17 +1851,22 @@ class KleinanzeigenService:
         Returns the parsed Listing if the download succeeded and created a YAML,
         otherwise None.
         """
-        await self._pre_session_setup()
-        returncode, stdout, stderr = await self._run_cli(
-            "download", "--ads", listing_id, timeout=DOWNLOAD_SINGLE_TIMEOUT
-        )
-        combined = (stdout + stderr).lower()
-        if returncode != 0 and "successfully" not in combined:
-            logger.warning(f"Single-listing download failed for {listing_id} (rc={returncode})")
+        for attempt in range(1, DOWNLOAD_SINGLE_ATTEMPTS + 1):
+            await self._pre_session_setup()
+            returncode, stdout, stderr = await self._run_cli(
+                "download", "--ads", listing_id, timeout=DOWNLOAD_SINGLE_TIMEOUT
+            )
+            combined = (stdout + stderr).lower()
+            if returncode == 0 or "successfully" in combined:
+                break
+            # e.g. sporadic "TypeError: Failed to fetch" on the ad-metadata request
+            logger.warning(f"Single-listing download failed for {listing_id} (rc={returncode}, attempt {attempt})")
+        else:
             return None
 
         yaml_path = self._find_yaml_by_listing_id(listing_id)
         if yaml_path:
+            self._archive_listing_images(listing_id, yaml_path.parent)
             return self._parse_ad_yaml(yaml_path)
         return None
 

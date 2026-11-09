@@ -41,7 +41,8 @@ class Listing(BaseModel):
     @property
     def should_delete(self) -> bool:
         """Check if listing price is too low for optimization (< 5 EUR)."""
-        return self.price < 5.0
+        from agents.listing_optimizer import MIN_REPUBLISH_PRICE
+        return self.price < MIN_REPUBLISH_PRICE
 
     def format_summary(self) -> str:
         """Format a short summary for Telegram."""

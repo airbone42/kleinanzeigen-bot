@@ -26,6 +26,23 @@ MEDIA_GROUP_WAIT_SECONDS = 3.0
 RECENT_UPLOAD_DEDUP_SECONDS = 30 * 60  # 30 minutes
 # Track recently processed uploads to prevent duplicate publishes
 _recent_upload_fingerprints: dict[str, float] = {}
+# Uploads waiting for the seller's answer: {chat_id: {"file_ids": [...], "caption": str}}
+_pending_info: dict[int, dict[str, Any]] = {}
+
+
+async def consume_pending_info(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, answer: str
+) -> bool:
+    """Re-run listing creation with the seller's answer added to the caption.
+
+    Returns True if a pending question existed and was handled.
+    """
+    pending = _pending_info.pop(chat_id, None)
+    if pending is None:
+        return False
+    caption = f"{pending['caption']}\n{answer}".strip()
+    await _create_listing(context, chat_id, pending["file_ids"], caption=caption)
+    return True
 
 
 def _truncate(text: str, limit: int = 900) -> str:
@@ -209,6 +226,7 @@ async def _create_listing(
             "images": images,
             "image_file_ids": file_ids,
             "image_analysis": "",
+            "needs_info": "",
             "title": "",
             "description": "",
             "price": 0.0,
@@ -228,6 +246,24 @@ async def _create_listing(
         )
 
         result = await get_listing_creator().ainvoke(initial_state)
+
+        if result.get("needs_info"):
+            # Photos not sufficient: ask instead of publishing a guess.
+            _recent_upload_fingerprints.pop(fingerprint, None)
+            _pending_info[chat_id] = {"file_ids": file_ids, "caption": caption}
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=progress_msg.message_id,
+                text=(
+                    "🤔 Ich kann den Artikel auf den Fotos nicht sicher erkennen. "
+                    "Es wurde nichts veröffentlicht.\n\n"
+                    f"{result['needs_info']}\n\n"
+                    "Antworte einfach mit Text (z.B. Marke, Modell, Zustand), "
+                    "dann starte ich mit den gleichen Fotos neu. "
+                    "Oder schicke weitere Fotos, besonders vom Typenschild oder Aufdruck."
+                ),
+            )
+            return
 
         # Save draft to database
         draft_id = await draft_repo.create(
@@ -293,6 +329,19 @@ async def _create_listing(
             ),
         )
         logger.info(f"Draft {draft_id} published to Kleinanzeigen, url={listing_url}")
+
+        from bot.handlers.vinted import mirror_new_listing
+        await mirror_new_listing(
+            context,
+            chat_id,
+            listing_url=listing_url,
+            title=result["title"],
+            description=result["description"],
+            price=float(result["price"]),
+            category=result.get("category", ""),
+            shipping_size=result.get("shipping_size", "PICKUP"),
+            images=image_bytes_list,
+        )
 
     except Exception as e:
         # Keep dedup lock if publish likely already succeeded to avoid duplicate listings.

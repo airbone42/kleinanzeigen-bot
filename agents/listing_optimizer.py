@@ -9,6 +9,8 @@ from agents.nodes.optimization import optimize_listing
 
 logger = logging.getLogger(__name__)
 
+MIN_REPUBLISH_PRICE = 5.0
+
 
 def route_by_price(state: ListingOptimizerState) -> Literal["optimize", "suggest_delete"]:
     """Route based on current listing price.
@@ -16,17 +18,28 @@ def route_by_price(state: ListingOptimizerState) -> Literal["optimize", "suggest
     Listings under 5 EUR get a deletion suggestion,
     others get optimized.
     """
-    if state.get("current_price", 0) < 5.0:
+    if state.get("current_price", 0) < MIN_REPUBLISH_PRICE:
         return "suggest_delete"
     return "optimize"
 
 
+def route_by_suggested_price(state: ListingOptimizerState) -> Literal["done", "suggest_delete"]:
+    """Suggest deletion when the optimizer lowered the price below the floor."""
+    if state.get("suggested_price", 0) < MIN_REPUBLISH_PRICE:
+        return "suggest_delete"
+    return "done"
+
+
 async def suggest_deletion(state: ListingOptimizerState) -> dict[str, Any]:
     """Prepare deletion suggestion for low-price listings."""
-    logger.info(f"Suggesting deletion for listing {state.get('listing_id')} (price < 5 EUR)")
+    price = state.get("suggested_price") or state.get("current_price", 0)
+    logger.info(
+        f"Suggesting deletion for listing {state.get('listing_id')} "
+        f"(price {price:.2f} < {MIN_REPUBLISH_PRICE:.0f} EUR)"
+    )
     return {
         "action": "delete",
-        "changes_summary": f"Preis {state.get('current_price', 0):.2f} EUR – Löschung empfohlen",
+        "changes_summary": f"Preis {price:.2f} EUR – Löschung empfohlen",
     }
 
 
@@ -61,7 +74,14 @@ def build_listing_optimizer_graph() -> Any:
         },
     )
 
-    graph.add_edge("optimize_listing", END)
+    graph.add_conditional_edges(
+        "optimize_listing",
+        route_by_suggested_price,
+        {
+            "done": END,
+            "suggest_delete": "suggest_delete",
+        },
+    )
     graph.add_edge("suggest_delete", END)
 
     return graph.compile()

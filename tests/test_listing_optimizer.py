@@ -155,3 +155,28 @@ class TestRouting:
 
         result = route_by_price(state)
         assert result == "optimize"
+
+
+class TestPriceFloorAfterOptimization:
+    """The deletion floor must also apply to the price suggested by the optimizer."""
+
+    @pytest.mark.asyncio
+    async def test_optimizer_lowering_below_floor_suggests_deletion(
+        self, valuable_listing_state: ListingOptimizerState
+    ) -> None:
+        from agents.listing_optimizer import build_listing_optimizer_graph
+
+        mock_response = MagicMock()
+        mock_response.content = '{"title": "Buch", "description": "x", "price": 4.0, "changes_summary": "billiger"}'
+
+        with patch("agents.nodes.optimization.get_optimization_llm") as mock_get_llm:
+            mock_llm = AsyncMock()
+            mock_llm.ainvoke.return_value = mock_response
+            mock_get_llm.return_value = mock_llm
+
+            result = await build_listing_optimizer_graph().ainvoke(
+                {**valuable_listing_state, "current_price": 6.0}
+            )
+
+        assert result["action"] == "delete"
+        assert "4.00" in result["changes_summary"]

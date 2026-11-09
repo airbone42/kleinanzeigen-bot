@@ -13,6 +13,7 @@ class ListingCreatorState(TypedDict):
     images: list[str]  # base64-encoded JPEG strings
     image_file_ids: list[str]  # Telegram file IDs for images
     image_analysis: str  # Result of image analysis
+    needs_info: str  # Questions for the seller; non-empty stops the workflow
     title: str  # Generated title (max 50 chars)
     description: str  # Generated description
     price: float  # Estimated price in EUR

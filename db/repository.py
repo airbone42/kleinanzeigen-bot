@@ -1,4 +1,5 @@
 """CRUD repository for drafts and listings."""
+import html
 import logging
 from typing import Optional
 
@@ -275,6 +276,46 @@ class DiscogsMappingRepository:
             return await cursor.fetchall()
         return []
 
+    @staticmethod
+    def matches_listing(row: aiosqlite.Row, listing_id: str, listing_title: str) -> bool:
+        """True if the mapping points to the listing by ID or by artist + title in its title.
+
+        The title fallback catches mappings whose ID went stale after a republish.
+        """
+        if listing_id and str(row["kleinanzeigen_listing_id"] or "") == str(listing_id):
+            return True
+        hay = html.unescape(listing_title or "").lower()
+        artist = str(row["artist"] or "").lower().strip()
+        title = str(row["title"] or "").lower().strip()
+        return bool(hay and artist and title and artist in hay and title in hay)
+
+    async def find_for_listing(self, listing_id: str, listing_title: str = "") -> Optional[aiosqlite.Row]:
+        """Find the active mapping belonging to a Kleinanzeigen listing."""
+        async for conn in get_connection():
+            cursor = await conn.execute("SELECT * FROM discogs_mappings WHERE status = 'active'")
+            rows = await cursor.fetchall()
+            for row in rows:
+                if str(row["kleinanzeigen_listing_id"] or "") == str(listing_id):
+                    return row
+            for row in rows:
+                if self.matches_listing(row, "", listing_title):
+                    return row
+        return None
+
+    async def set_listing_id(self, mapping_id: int, listing_id: str, listing_url: str) -> None:
+        """Point a mapping to a new Kleinanzeigen listing (e.g. after a republish)."""
+        async for conn in get_connection():
+            await conn.execute(
+                """
+                UPDATE discogs_mappings
+                SET kleinanzeigen_listing_id = ?, kleinanzeigen_listing_url = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (listing_id, listing_url, mapping_id),
+            )
+            await conn.commit()
+
     async def mark_deleted(self, chat_id: int, discogs_release_id: str) -> None:
         """Mark a mapping as deleted."""
         async for conn in get_connection():
@@ -289,6 +330,141 @@ class DiscogsMappingRepository:
             await conn.commit()
 
 
+class VintedMappingRepository:
+    """Kleinanzeigen listing <-> Vinted item mappings (services/vinted_sync.py)."""
+
+    # Rows the sync still watches on both platforms.
+    LIVE_STATUSES = ("active", "draft", "hidden")
+
+    async def get_by_ka(self, ka_listing_id: str) -> Optional[aiosqlite.Row]:
+        async for conn in get_connection():
+            cursor = await conn.execute(
+                "SELECT * FROM vinted_mappings WHERE ka_listing_id = ?", (str(ka_listing_id),)
+            )
+            return await cursor.fetchone()
+        return None
+
+    async def get_live(self) -> list[aiosqlite.Row]:
+        placeholders = ",".join("?" for _ in self.LIVE_STATUSES)
+        async for conn in get_connection():
+            cursor = await conn.execute(
+                f"SELECT * FROM vinted_mappings WHERE status IN ({placeholders}) ORDER BY id",
+                self.LIVE_STATUSES,
+            )
+            return list(await cursor.fetchall())
+        return []
+
+    async def get_all(self) -> list[aiosqlite.Row]:
+        async for conn in get_connection():
+            cursor = await conn.execute("SELECT * FROM vinted_mappings ORDER BY id")
+            return list(await cursor.fetchall())
+        return []
+
+    async def save(
+        self,
+        ka_listing_id: str,
+        *,
+        status: str,
+        chat_id: int = 0,
+        vinted_item_id: Optional[str] = None,
+        vinted_url: Optional[str] = None,
+        title: str = "",
+        price: Optional[float] = None,
+        last_error: Optional[str] = None,
+        count_attempt: bool = False,
+    ) -> None:
+        """Insert or update the mapping of one Kleinanzeigen listing."""
+        async for conn in get_connection():
+            await conn.execute(
+                """
+                INSERT INTO vinted_mappings
+                    (chat_id, ka_listing_id, vinted_item_id, vinted_url, title, price, status,
+                     attempts, last_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ka_listing_id) DO UPDATE SET
+                    chat_id = CASE WHEN excluded.chat_id != 0 THEN excluded.chat_id ELSE chat_id END,
+                    vinted_item_id = COALESCE(excluded.vinted_item_id, vinted_item_id),
+                    vinted_url = COALESCE(excluded.vinted_url, vinted_url),
+                    title = CASE WHEN excluded.title != '' THEN excluded.title ELSE title END,
+                    price = COALESCE(excluded.price, price),
+                    status = excluded.status,
+                    attempts = attempts + excluded.attempts,
+                    last_error = excluded.last_error,
+                    ka_missing_runs = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    chat_id, str(ka_listing_id), vinted_item_id, vinted_url, title, price, status,
+                    1 if count_attempt else 0, last_error,
+                ),
+            )
+            await conn.commit()
+
+    async def set_status(
+        self, ka_listing_id: str, status: str, last_error: Optional[str] = None
+    ) -> None:
+        async for conn in get_connection():
+            await conn.execute(
+                """
+                UPDATE vinted_mappings
+                SET status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE ka_listing_id = ?
+                """,
+                (status, last_error, str(ka_listing_id)),
+            )
+            await conn.commit()
+
+    async def bump_missing(self, ka_listing_id: str) -> int:
+        """Count one more sync run without the listing on Kleinanzeigen; returns the count."""
+        async for conn in get_connection():
+            await conn.execute(
+                """
+                UPDATE vinted_mappings
+                SET ka_missing_runs = ka_missing_runs + 1, updated_at = CURRENT_TIMESTAMP
+                WHERE ka_listing_id = ?
+                """,
+                (str(ka_listing_id),),
+            )
+            await conn.commit()
+            cursor = await conn.execute(
+                "SELECT ka_missing_runs FROM vinted_mappings WHERE ka_listing_id = ?",
+                (str(ka_listing_id),),
+            )
+            row = await cursor.fetchone()
+            return int(row["ka_missing_runs"]) if row else 0
+        return 0
+
+    async def reset_missing(self, ka_listing_id: str) -> None:
+        async for conn in get_connection():
+            await conn.execute(
+                "UPDATE vinted_mappings SET ka_missing_runs = 0 WHERE ka_listing_id = ? "
+                "AND ka_missing_runs != 0",
+                (str(ka_listing_id),),
+            )
+            await conn.commit()
+
+    async def rekey(self, old_ka_id: str, new_ka_id: str, title: str = "") -> bool:
+        """Follow a Kleinanzeigen republish (new listing ID, same item).
+
+        Without this the old ID vanishes from Kleinanzeigen and the sync would delete
+        the still-for-sale item on Vinted.
+        """
+        if str(old_ka_id) == str(new_ka_id):
+            return False
+        async for conn in get_connection():
+            cursor = await conn.execute(
+                "UPDATE vinted_mappings SET ka_listing_id = ?, ka_missing_runs = 0, "
+                "title = CASE WHEN ? != '' THEN ? ELSE title END, updated_at = CURRENT_TIMESTAMP "
+                "WHERE ka_listing_id = ? AND NOT EXISTS "
+                "(SELECT 1 FROM vinted_mappings WHERE ka_listing_id = ?)",
+                (str(new_ka_id), title, title, str(old_ka_id), str(new_ka_id)),
+            )
+            await conn.commit()
+            return (cursor.rowcount or 0) > 0
+        return False
+
+
 draft_repo = DraftRepository()
 listing_repo = ListingRepository()
 discogs_mapping_repo = DiscogsMappingRepository()
+vinted_mapping_repo = VintedMappingRepository()

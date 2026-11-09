@@ -80,6 +80,26 @@ CREATE TABLE IF NOT EXISTS discogs_mappings (
 )
 """
 
+# Kleinanzeigen listing <-> Vinted item. status: active | draft | hidden | sold_vinted |
+# sold_ka | vinted_removed | skipped | failed (see services/vinted_sync.py)
+CREATE_VINTED_MAPPINGS_TABLE = """
+CREATE TABLE IF NOT EXISTS vinted_mappings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL DEFAULT 0,
+    ka_listing_id TEXT NOT NULL UNIQUE,
+    vinted_item_id TEXT DEFAULT NULL,
+    vinted_url TEXT DEFAULT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    price REAL DEFAULT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    ka_missing_runs INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
 
 async def get_connection() -> AsyncGenerator[aiosqlite.Connection, None]:
     """Get an async database connection."""
@@ -107,6 +127,7 @@ async def init_database() -> None:
         await conn.execute(CREATE_LISTINGS_TABLE)
         await conn.execute(CREATE_DRAFT_IMAGES_TABLE)
         await conn.execute(CREATE_DISCOGS_MAPPINGS_TABLE)
+        await conn.execute(CREATE_VINTED_MAPPINGS_TABLE)
 
         # Migration: add shipping_type column to existing databases
         try:

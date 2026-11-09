@@ -599,7 +599,7 @@ class TestListingModel:
 class TestRepublishWithOptimization:
     """Tests for republish_with_optimization – URL/ID extraction paths."""
 
-    def _make_ad_dir(self, service: "KleinanzeigenService", listing_id: str) -> Path:
+    def _make_ad_dir(self, service: "KleinanzeigenService", listing_id: str, *, with_image: bool = True) -> Path:
         ad_dir = service.ads_dir / f"ad_{listing_id}"
         ad_dir.mkdir(parents=True, exist_ok=True)
         ad_data = {
@@ -610,6 +610,9 @@ class TestRepublishWithOptimization:
             "price": 20,
             "category": "Sonstiges",
         }
+        if with_image:
+            (ad_dir / f"ad_{listing_id}__img1.jpg").write_bytes(b"jpg")
+            ad_data["images"] = [f"ad_{listing_id}__img1.jpg"]
         with open(ad_dir / "ad.yaml", "w") as f:
             yaml.dump(ad_data, f)
         return ad_dir
@@ -730,6 +733,151 @@ class TestRepublishWithOptimization:
         assert not remaining_dirs, f"Temp dirs not cleaned up: {remaining_dirs}"
 
 
+class TestRepublishImageGuard:
+    """Regression: download sporadically yields 0 images → republish must not drop them."""
+
+    _make_ad_dir = TestRepublishWithOptimization._make_ad_dir
+
+    @staticmethod
+    def _published_images(service: "KleinanzeigenService") -> list[str]:
+        new_dirs = [d for d in service.ads_dir.iterdir() if d.is_dir() and d.name.startswith("ad_")]
+        assert len(new_dirs) == 1
+        with open(new_dirs[0] / "ad.yaml") as f:
+            return list((yaml.safe_load(f) or {}).get("images") or [])
+
+    @pytest.mark.asyncio
+    async def test_images_archived_and_moved_to_new_id(self, service: "KleinanzeigenService") -> None:
+        self._make_ad_dir(service, "111222340")
+        stdout = "https://www.kleinanzeigen.de/s-anzeige/regal/999888740-234-4477"
+        with patch.object(service, "_run_cli", new=AsyncMock(return_value=(0, stdout, ""))), \
+             patch.object(service, "_pre_session_setup", new=AsyncMock()), \
+             patch.object(service, "delete_listing", new=AsyncMock(return_value=True)):
+            _, warning = await service.republish_with_optimization("111222340")
+
+        assert warning is None
+        assert (service.image_archive_dir / "999888740" / "ad_111222340__img1.jpg").exists()
+        assert not (service.image_archive_dir / "111222340").exists()
+
+    @pytest.mark.asyncio
+    async def test_missing_images_restored_from_archive(self, service: "KleinanzeigenService") -> None:
+        self._make_ad_dir(service, "111222341", with_image=False)
+        archive = service.image_archive_dir / "111222341"
+        archive.mkdir(parents=True)
+        (archive / "old__img1.jpg").write_bytes(b"jpg")
+        (archive / "old__img2.jpg").write_bytes(b"jpg")
+
+        published: list[str] = []
+
+        async def fake_run_cli(*args: str, **kwargs: object) -> tuple[int, str, str]:
+            published.extend(self._published_images(service))
+            return (0, "https://www.kleinanzeigen.de/s-anzeige/regal/999888741", "")
+
+        with patch.object(service, "_run_cli", new=AsyncMock(side_effect=fake_run_cli)), \
+             patch.object(service, "_pre_session_setup", new=AsyncMock()), \
+             patch.object(service, "delete_listing", new=AsyncMock(return_value=True)):
+            _, warning = await service.republish_with_optimization("111222341")
+
+        assert published == ["old__img1.jpg", "old__img2.jpg"]
+        assert warning is None
+        assert (service.image_archive_dir / "999888741" / "old__img2.jpg").exists()
+
+    @pytest.mark.asyncio
+    async def test_no_images_anywhere_keeps_old_ad(self, service: "KleinanzeigenService") -> None:
+        from services.kleinanzeigen import KleinanzeigenError
+
+        self._make_ad_dir(service, "111222342", with_image=False)
+        mock_download = AsyncMock(return_value=None)
+        mock_cli = AsyncMock(return_value=(0, "/999888742 ok", ""))
+        mock_delete = AsyncMock(return_value=True)
+        with patch.object(service, "_run_cli", new=mock_cli), \
+             patch.object(service, "_pre_session_setup", new=AsyncMock()), \
+             patch.object(service, "download_single_listing", new=mock_download), \
+             patch.object(service, "delete_listing", new=mock_delete):
+            with pytest.raises(KleinanzeigenError, match="bleibt online"):
+                await service.republish_with_optimization("111222342")
+
+        mock_download.assert_awaited_once_with("111222342")
+        mock_cli.assert_not_awaited()
+        mock_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_discogs_listing_uses_cover_and_updates_mapping(self, service: "KleinanzeigenService") -> None:
+        from db.repository import discogs_mapping_repo
+
+        self._make_ad_dir(service, "111222344", with_image=False)
+        await discogs_mapping_repo.upsert_mapping(
+            chat_id=1, discogs_release_id="r-111222344", discogs_inventory_id="", artist="Testband",
+            title="Testplatte", label="", year=None, media_condition="", discogs_price=0.0,
+            median_price=0.0, image_url="https://img.example/cover.jpg",
+            kleinanzeigen_listing_id="111222344", kleinanzeigen_listing_url="",
+        )
+        published: list[str] = []
+
+        async def fake_run_cli(*args: str, **kwargs: object) -> tuple[int, str, str]:
+            published.extend(self._published_images(service))
+            return (0, "https://www.kleinanzeigen.de/s-anzeige/platte/999888744", "")
+
+        async def fake_cover(listing_id: str, image_url: str) -> bool:
+            assert image_url == "https://img.example/cover.jpg"
+            target = service.image_archive_dir / listing_id
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "discogs_cover.jpg").write_bytes(b"jpg")
+            return True
+
+        with patch.object(service, "_run_cli", new=AsyncMock(side_effect=fake_run_cli)), \
+             patch.object(service, "_pre_session_setup", new=AsyncMock()), \
+             patch.object(service, "download_single_listing", new=AsyncMock(return_value=None)), \
+             patch.object(service, "_archive_discogs_cover", new=AsyncMock(side_effect=fake_cover)), \
+             patch.object(service, "delete_listing", new=AsyncMock(return_value=True)):
+            _, warning = await service.republish_with_optimization("111222344")
+
+        assert published == ["discogs_cover.jpg"]
+        assert warning is None
+        row = await discogs_mapping_repo.find_for_listing("999888744")
+        assert row is not None and row["discogs_release_id"] == "r-111222344"
+
+    @pytest.mark.asyncio
+    async def test_download_single_listing_archives_images(self, service: "KleinanzeigenService") -> None:
+        ad_dir = service.downloaded_ads_dir / "ad_111222343_Regal"
+        ad_dir.mkdir(parents=True)
+        (ad_dir / "ad_111222343__img1.jpg").write_bytes(b"jpg")
+        with open(ad_dir / "ad_111222343.yaml", "w") as f:
+            yaml.dump({"id": 111222343, "title": "Altes Regal 123", "description": "x", "price": 5}, f)
+        with patch.object(service, "_run_cli", new=AsyncMock(return_value=(0, "", ""))), \
+             patch.object(service, "_pre_session_setup", new=AsyncMock()):
+            await service.download_single_listing("111222343")
+
+        assert (service.image_archive_dir / "111222343" / "ad_111222343__img1.jpg").exists()
+
+
+    @pytest.mark.asyncio
+    async def test_download_single_listing_retries_once(self, service: "KleinanzeigenService") -> None:
+        ad_dir = service.downloaded_ads_dir / "ad_111222344_Regal"
+        ad_dir.mkdir(parents=True)
+        with open(ad_dir / "ad_111222344.yaml", "w") as f:
+            yaml.dump({"id": 111222344, "title": "Altes Regal 123", "description": "x", "price": 5}, f)
+        mock_cli = AsyncMock(side_effect=[(1, "", "TypeError: Failed to fetch"), (0, "", "")])
+        with patch.object(service, "_run_cli", new=mock_cli), \
+             patch.object(service, "_pre_session_setup", new=AsyncMock()):
+            listing = await service.download_single_listing("111222344")
+
+        assert mock_cli.await_count == 2
+        assert listing is not None
+
+
+class TestExtractBotErrorBatchFailure:
+    def test_skips_ansi_batch_traceback(self, service: "KleinanzeigenService") -> None:
+        out = (
+            "\x1b[31m[ERROR]\x1b[0m All 3 attempts failed for 'Regal': Ad form validation failed: Art: Bitte gib einen Wert ein.. Skipping ad.\n"
+            "[INFO] DONE: (Re-)published 0 ads (1 failed)\n"
+            "\x1b[31m[ERROR]\x1b[0m \x1b[31mTraceback (most recent call last):\n"
+            "kleinanzeigen_bot.utils.exceptions.AdBatchError: Failed to publish 1 ad\n"
+        )
+        msg = service._extract_bot_error(out)
+        assert "Art: Bitte gib einen Wert ein" in msg
+        assert "\x1b" not in msg
+
+
 class TestPublishNewAdShippingRetry:
     """Tests for _publish_new_ad shipping-dialog retry logic."""
 
@@ -783,6 +931,65 @@ class TestPublishNewAdShippingRetry:
         mock_delete.assert_awaited_once_with("OLD123")
         assert yaml_data_on_retry.get("category") == "Mode & Beauty > Schuhe"
         assert "special_attributes" not in yaml_data_on_retry
+
+    @pytest.mark.asyncio
+    async def test_category_retry_stops_at_submit_boundary(
+        self, service: "KleinanzeigenService"
+    ) -> None:
+        """Regression (2026-10-09): a category retry that reached the submit boundary may be
+        live already – further category/PICKUP retries posted the same ad 3x."""
+        ad_dir, new_yaml = self._make_ad_dir_with_shipping(service)
+
+        call_count = 0
+
+        async def fake_run_cli(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (0, "", "No HTML element found with ID 'ad-shipping-options'\n"
+                               "DONE: (Re-)published 0 ads (1 failed after retries)")
+            return (0, "", "Attempt 1/3 reached submit boundary but failed: submission may have succeeded\n"
+                           "DONE: (Re-)published 0 ads (1 failed after retries)")
+
+        live = [{"id": 123, "title": "Specialized Recon"}, {"id": 555444333, "title": "Specialized Recon"}]
+        mock_delete = AsyncMock(return_value=True)
+        mock_suggest = AsyncMock(return_value=["A", "B", "C"])
+        with patch.object(service, "_run_cli", new=AsyncMock(side_effect=fake_run_cli)), \
+             patch.object(service, "_pre_session_setup", new=AsyncMock()), \
+             patch.object(service, "delete_listing", new=mock_delete), \
+             patch.object(service, "_fetch_published_ads_raw", new=AsyncMock(return_value=live)), \
+             patch.object(service, "_suggest_alternative_categories", new=mock_suggest), \
+             patch("services.kleinanzeigen.asyncio.sleep", new=AsyncMock()):
+            result, _ = await service._publish_new_ad(ad_dir, new_yaml, "123")
+
+        assert call_count == 2
+        assert "555444333" in result
+        mock_delete.assert_awaited_once_with("123")
+
+    @pytest.mark.asyncio
+    async def test_submit_boundary_without_new_ad_and_old_live_fails(
+        self, service: "KleinanzeigenService"
+    ) -> None:
+        """Regression (2026-10-22): submit boundary, no new ad found and the old one still live –
+        must report a failure instead of '✅ wahrscheinlich veröffentlicht'."""
+        from services.kleinanzeigen import KleinanzeigenError
+        ad_dir, new_yaml = self._make_ad_dir_with_shipping(service)
+
+        async def fake_run_cli(*args, **kwargs):
+            return (0, "", "Attempt 1/3 reached submit boundary but failed: submission may have succeeded\n"
+                           "DONE: (Re-)published 0 ads (1 failed after retries)")
+
+        live = [{"id": 123, "title": "Specialized Recon alt"}, {"id": 999, "title": "Anderes"}]
+        mock_delete = AsyncMock(return_value=True)
+        with patch.object(service, "_run_cli", new=AsyncMock(side_effect=fake_run_cli)), \
+             patch.object(service, "_pre_session_setup", new=AsyncMock()), \
+             patch.object(service, "delete_listing", new=mock_delete), \
+             patch.object(service, "_fetch_published_ads_raw", new=AsyncMock(return_value=live)), \
+             patch("services.kleinanzeigen.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(KleinanzeigenError, match="NICHT gelöscht"):
+                await service._publish_new_ad(ad_dir, new_yaml, "123")
+
+        mock_delete.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_retry_on_unrelated_failure(self, service: "KleinanzeigenService") -> None:
@@ -1171,3 +1378,62 @@ class TestDeleteListing:
 
         assert "sell_directly requires shipping_type to be SHIPPING" in str(exc.value)
         assert "banner" not in str(exc.value)
+
+
+class TestRunCliTimeout:
+    """A timeout must kill the whole CLI process tree, not just the Python child."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_grandchild(self, service, tmp_path: Path) -> None:
+        import os
+        import sys
+        from services.kleinanzeigen import KleinanzeigenError
+
+        pid_file = tmp_path / "grandchild.pid"
+        # Stand-in for nodriver spawning Chromium: a grandchild that outlives its parent.
+        script = (
+            "import subprocess, sys, time;"
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
+            f"open({str(pid_file)!r}, 'w').write(str(p.pid));"
+            "time.sleep(60)"
+        )
+        service.config_file = tmp_path / "missing.yaml"
+        with patch.object(service, "_get_cli_command", return_value=[sys.executable, "-c", script]):
+            with pytest.raises(KleinanzeigenError, match="timed out"):
+                await service._run_cli(timeout=2)
+
+        grandchild = int(pid_file.read_text())
+        for _ in range(20):
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                break
+            if Path(f"/proc/{grandchild}/stat").read_text().split()[2] == "Z":
+                break
+            await asyncio.sleep(0.1)
+        else:
+            os.kill(grandchild, 9)
+            pytest.fail("grandchild survived the CLI timeout")
+
+
+
+def test_discogs_mapping_matches_stale_id_by_title() -> None:
+    from db.repository import DiscogsMappingRepository
+
+    row = {"kleinanzeigen_listing_id": "3346741878", "artist": "Die Ärzte", "title": "Jazz Ist Anders"}
+    match = DiscogsMappingRepository.matches_listing
+    assert match(row, "3346741878", "")  # type: ignore[arg-type]
+    assert match(row, "3544021122", "Die Ärzte - Jazz ist Anders Vinyl 2007 (NM&#x2F;G+)")  # type: ignore[arg-type]
+    assert not match(row, "3544021122", "Die Ärzte - Planet Punk")  # type: ignore[arg-type]
+
+
+def test_extract_listing_id_ignores_devtools_uuid() -> None:
+    from services.kleinanzeigen import KleinanzeigenService
+
+    output = (
+        "[INFO] New Browser session is ws://127.0.0.1:57425/devtools/browser/03509831-9b9e-4cad-8d11-15f8759216c3\n"
+        "[INFO]  -> SUCCESS: ad published with ID 3544131712\n"
+    )
+    service = KleinanzeigenService.__new__(KleinanzeigenService)
+    assert service._extract_listing_id(output) == "3544131712"
+    assert service._extract_listing_id(output.splitlines()[0]) is None

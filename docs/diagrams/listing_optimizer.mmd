@@ -1,8 +1,21 @@
-flowchart TD
-    START([START]) --> check_price[check_price]
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	check_price(check_price)
+	optimize_listing(optimize_listing)
+	suggest_delete(suggest_delete)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> check_price;
+	check_price -. &nbsp;optimize&nbsp; .-> optimize_listing;
+	check_price -.-> suggest_delete;
+	optimize_listing -. &nbsp;done&nbsp; .-> __end__;
+	optimize_listing -.-> suggest_delete;
+	suggest_delete --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
 
-    check_price -->|optimize| optimize_listing[optimize_listing]
-    check_price -->|suggest_delete| suggest_delete[suggest_delete]
-
-    optimize_listing --> END([END])
-    suggest_delete --> END

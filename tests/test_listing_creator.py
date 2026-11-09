@@ -307,8 +307,8 @@ class TestDraftReview:
     """Tests for the draft review node."""
 
     @pytest.mark.asyncio
-    async def test_review_fixes_empty_title(self) -> None:
-        """Test that review fixes an empty title."""
+    async def test_review_asks_instead_of_placeholder_title(self) -> None:
+        """Test that an empty title triggers a question, not the placeholder title."""
         from agents.nodes.listing_finalize import finalize_listing
 
         state: ListingCreatorState = {
@@ -326,8 +326,9 @@ class TestDraftReview:
         }
 
         result = await finalize_listing(state)
-        assert result["title"] != ""
-        assert len(result["title"]) <= 50
+        # Placeholder title must never be published: ask the seller instead.
+        assert result["needs_info"]
+        assert "title" not in result
 
     @pytest.mark.asyncio
     async def test_review_fixes_negative_price(self) -> None:
@@ -568,3 +569,27 @@ class TestGraphConcurrencyRegression:
 
         assert result["description"] == "from_finalize"
         assert result["status"] == "draft"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Modellnummer (M/N): USG",
+        "Die Modellnummer ist USG",
+        "Aufdruck M/N: USG, Modellnummer sichtbar",
+    ],
+)
+def test_title_tokens_skip_plain_words_after_modell(text: str) -> None:
+    """Words like 'nummer', 'ist', 'sichtbar' must not be appended to the title."""
+    from agents.nodes.text_generation import _extract_required_title_tokens
+
+    tokens = _extract_required_title_tokens(text)
+    assert not {"nummer", "ist", "sichtbar"} & {t.lower() for t in tokens}
+
+
+def test_title_tokens_keep_real_identifiers() -> None:
+    from agents.nodes.text_generation import _extract_required_title_tokens
+
+    assert "USG" in _extract_required_title_tokens("Modellnummer: USG")
+    assert "ER-X" in _extract_required_title_tokens("Modell ER-X")
+    assert "108" in " ".join(_extract_required_title_tokens("Breite 108"))

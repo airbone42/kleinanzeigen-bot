@@ -43,6 +43,9 @@ case "$CMD" in
   warmup)
     _check_container
     echo "=== Running pre-session Playwright warmup — dumps page HTML to stdout ==="
+    # Playwright is no longer a dependency; install only the Python package on demand.
+    # It drives the image's Debian Chromium (binary_location), no browser download.
+    docker exec "$CONTAINER" pip install -q playwright
     docker exec -it "$CONTAINER" python -c "
 import asyncio, logging, os, sys
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s %(message)s')

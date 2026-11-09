@@ -44,8 +44,8 @@ def _patch_shipping_extraction() -> None:
     if getattr(original, "_kb_patched", False):
         return
 
-    async def _patched_extract_shipping_info(self: Any) -> tuple:
-        result = await original(self)
+    async def _patched_extract_shipping_info(self: Any, *args: Any, **kwargs: Any) -> tuple:
+        result = await original(self, *args, **kwargs)
         if result[0] != "NOT_APPLICABLE":
             return result
         fallback = await shipping_from_island_props(self)

@@ -54,3 +54,26 @@ def test_sanitize_ad_yaml_canonicalizes_category() -> None:
     )
     assert clean["category"] == "Musik, Filme & Bücher > Bücher & Zeitschriften"
     assert "bogus" not in clean
+
+
+def test_numeric_path_from_download_is_kept() -> None:
+    """The pinned bot downloads numeric paths; they must not fall back to Trödel."""
+    assert resolve_category("73/77") == "73/77"
+    assert canonical_category("73/77") == "73/77"
+
+
+def test_numeric_path_with_subcategory_is_kept() -> None:
+    assert resolve_category("161/172/lautsprecher_kopfhoerer") == "161/172/lautsprecher_kopfhoerer"
+    assert resolve_category("73/76/sachbuecher") == "73/76/sachbuecher"
+
+
+def test_unknown_numeric_path_returns_none() -> None:
+    assert resolve_category("99999/1") is None
+    assert canonical_category("99999/1") == DEFAULT_CATEGORY
+
+
+def test_sanitize_ad_yaml_keeps_numeric_category() -> None:
+    from services.kleinanzeigen import KleinanzeigenService
+
+    clean = KleinanzeigenService._sanitize_ad_yaml({"title": "x", "category": "73/77"})
+    assert clean["category"] == "73/77"

@@ -8,9 +8,10 @@
 # Usage: scripts/publish_public.sh ["commit message"]
 set -euo pipefail
 
-REMOTE="${PUBLIC_REPO_REMOTE:-git@github.com:airbone42/kleinanzeigen-bot.git}"
+# Host alias from ~/.ssh/config; uses the repo-specific deploy key gh_kleinanzeigen.
+REMOTE="${PUBLIC_REPO_REMOTE:-git@github-kleinanzeigen:airbone42/kleinanzeigen-bot.git}"
 BRANCH="${PUBLIC_REPO_BRANCH:-main}"
-PRIVATE_PATHS=("CLAUDE.md")
+PRIVATE_PATHS=("CLAUDE.md" "deploy")
 
 MESSAGE="${1:-chore: sync from private repo}"
 

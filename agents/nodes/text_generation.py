@@ -30,6 +30,11 @@ Regeln:
 Antworte NUR mit dem Titel, ohne Anführungszeichen."""
 
 
+def _looks_like_identifier(token: str) -> bool:
+    """True for model/size identifiers: contains a digit or is all upper case."""
+    return any(c.isdigit() for c in token) or (token.isupper() and len(token) >= 2)
+
+
 def _extract_required_title_tokens(text: str) -> list[str]:
     """Extract high-value search tokens (dimension/model identifiers)."""
     tokens: list[str] = []
@@ -40,11 +45,14 @@ def _extract_required_title_tokens(text: str) -> list[str]:
         tokens.append(f"{value}{unit}")
 
     for m in re.finditer(
-        r"\b(?:größe|groesse|breite|höhe|hoehe|länge|laenge|size|modell(?:nummer)?|model)\s*[:#-]?\s*([A-Z0-9-]{2,})\b",
+        r"\b(?:größe|groesse|breite|höhe|hoehe|länge|laenge|size|modell(?:nummer)?|model)\b\s*[:#-]?\s*([A-Za-z0-9-]{2,})\b",
         text,
         re.IGNORECASE,
     ):
-        tokens.append(m.group(1))
+        # Only real identifiers (digit or all caps like "USG", "ER-X"), not the next
+        # German word ("Modellnummer ist ...", "Modellnummer sichtbar").
+        if _looks_like_identifier(m.group(1)):
+            tokens.append(m.group(1))
 
     for m in re.finditer(r"\b\d{5,}\b", text):
         tokens.append(m.group(0))

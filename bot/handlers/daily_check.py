@@ -213,11 +213,12 @@ async def run_daily_check(
         reserved_count = sum(1 for l in listings if l.status == "reserved")
 
         # Exclude Discogs-synced listings from renewal — Discogs sync owns their lifecycle
+        # (by ID, or by artist + title when the mapped ID went stale after a republish)
         discogs_mappings = await discogs_mapping_repo.get_active_by_chat(chat_id)
         discogs_listing_ids = {
-            str(row["kleinanzeigen_listing_id"])
-            for row in discogs_mappings
-            if row["kleinanzeigen_listing_id"]
+            l.listing_id
+            for l in listings
+            if any(discogs_mapping_repo.matches_listing(row, l.listing_id, l.title) for row in discogs_mappings)
         }
 
         renewable = [

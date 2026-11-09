@@ -2,20 +2,24 @@
 
 An intelligent Telegram bot that automatically creates, manages and optimizes
 [Kleinanzeigen](https://www.kleinanzeigen.de) classified listings. Send it photos
-of an item and it drafts a title, description and price with an LLM; it also renews
-expiring listings and can sync a Discogs record inventory to Kleinanzeigen.
+of an item and it writes title, description and price with an LLM and publishes the listing;
+it also renews expiring listings, can mirror listings to [Vinted](https://www.vinted.de)
+(sold on one platform = removed on the other) and can sync a Discogs record inventory to
+Kleinanzeigen.
 
-> **Disclaimer.** This project is **not affiliated** with Kleinanzeigen or Discogs.
-> Automating kleinanzeigen.de may conflict with its Terms of Service, and the Discogs
+> **Disclaimer.** This project is **not affiliated** with Kleinanzeigen, Vinted or Discogs.
+> Automating kleinanzeigen.de may conflict with its Terms of Service, Vinted's terms forbid
+> bots and cross-listing (accounts can be banned, see [docs/vinted.md](docs/vinted.md)), and the Discogs
 > features use the Discogs API under the [Discogs API Terms](https://www.discogs.com/developers).
 > Use at your own risk, for personal purposes, and make sure you comply with the terms
 > of any service you automate. No warranty of any kind.
 
 ## Features
 
-- 📸 **Photo-based listing creation** – send photos, an LLM writes the title, description and estimates a price.
-- 💬 **Feedback loop** – review and adjust each draft (title / text / price / free-text feedback) before it goes live.
+- 📸 **Photo-based listing creation** – send photos, an LLM writes the title, description and estimates a price, the listing goes live right away.
+- 🤔 **Asks instead of guessing** – if the photos do not show clearly what the item is, the bot asks for brand/model and publishes nothing until you answer.
 - 🔄 **Daily listing check** – expiring listings are automatically optimized or proposed for deletion.
+- 👗 **Vinted mirror (optional)** – new listings also go to Vinted; sold on Vinted deletes the Kleinanzeigen listing, gone from Kleinanzeigen deletes the Vinted item, reserved hides it. See [docs/vinted.md](docs/vinted.md).
 - 💿 **Discogs sync** – turn your Discogs record inventory into Kleinanzeigen listings.
 - 🔒 **User restriction** – only allow-listed Telegram user IDs may use the bot (the bot refuses to start without one).
 
@@ -26,14 +30,14 @@ Telegram (user) <--> Telegram bot (python-telegram-bot)
                          |
                     LangGraph agents
                     +-- Create listing   (photo -> draft)
-                    +-- Draft feedback loop
                     +-- Daily listing check (scheduler)
                     +-- Listing optimization / deletion
                     +-- Discogs inventory sync
+                    +-- Vinted mirror + sold sync (scheduler)
                          |
-                +--------+--------+
-          OpenRouter API     kleinanzeigen-bot CLI
-          (LLM calls)        (Kleinanzeigen interaction)
+                +--------+------------+----------------------+
+          OpenRouter API     kleinanzeigen-bot CLI     Chromium (nodriver)
+          (LLM calls)        (Kleinanzeigen)           in-page fetch to the Vinted web API
 ```
 
 The bot orchestrates workflows with [LangGraph](https://github.com/langchain-ai/langgraph),
@@ -44,9 +48,10 @@ calls LLMs through [OpenRouter](https://openrouter.ai), and drives Kleinanzeigen
 
 - **Python 3.11+**
 - **git** – one dependency (`kleinanzeigen-bot`) is installed directly from GitHub.
-- **Chromium via Playwright** – `kleinanzeigen-bot` drives a real browser. On first start the
-  bot runs `playwright install chromium` automatically, so an internet connection is required
-  the first time (the Docker image bundles this).
+- **Chromium** – `kleinanzeigen-bot` drives a real browser. Install your distribution's
+  package (Debian: `apt install chromium`) or set `CHROMIUM_PATH`. The Docker image installs
+  the Debian package. Playwright's bundled Chromium is not used any more: it stays on the
+  version of its Playwright release and misses browser security fixes.
 - A **Telegram bot token** – create one via [@BotFather](https://t.me/BotFather).
 - Your **Telegram user ID** – message [@userinfobot](https://t.me/userinfobot) to get it.
 - An **OpenRouter API key** – from [openrouter.ai](https://openrouter.ai).
@@ -92,7 +97,7 @@ cp .env.example .env      # then fill in your tokens (see Configuration)
 docker compose up -d --build
 ```
 
-The image bundles Chromium, and `docker-entrypoint.sh` starts an Xvfb virtual display so the
+The image installs Debian's `chromium` package (rebuild it for Chromium security updates), and `docker-entrypoint.sh` starts an Xvfb virtual display so the
 browser can run in the container. `.env`, `./kleinanzeigen-config` and `./data` are mounted in.
 
 ## Configuration
@@ -114,6 +119,8 @@ Fill in `.env` (see `.env.example` for the full list). Key variables:
 | `DISCOGS_USER_TOKEN` / `DISCOGS_USERNAME` | – | Only needed for `/discogssync` |
 | `DAILY_CHECK_HOUR` / `DAILY_CHECK_MINUTE` | – | When the daily check runs (default 06:00) |
 | `SHIPPING_EXPIRING_DAYS` / `PICKUP_EXPIRING_DAYS` | – | "Expiring soon" thresholds (default 10 / 30 days) |
+| `VINTED_ENABLED` | – | Mirror listings to Vinted (default `false`, see [docs/vinted.md](docs/vinted.md)) |
+| `VINTED_SYNC_HOURS` / `VINTED_BACKFILL_PER_RUN` / `VINTED_PRICE_FACTOR` | – | Vinted sync times, older listings mirrored per run, price factor |
 | `LANGCHAIN_TRACING_V2` / `LANGCHAIN_API_KEY` / `LANGCHAIN_PROJECT` | – | Optional LangSmith tracing |
 | `LOG_LEVEL` / `DATABASE_PATH` | – | Logging level, SQLite path |
 
@@ -147,11 +154,9 @@ ad_defaults:
 
 1. Send the bot one or more photos (up to 10) of your item.
 2. It analyzes the images and generates a draft (title, description, price).
-3. Review the draft and use the inline buttons:
-   - **✅ Approve** – publish the listing to Kleinanzeigen
-   - **✏️ Title / Text / Price** – edit individual fields
-   - **💬 Feedback** – free-text feedback for a full revision
-   - **❌ Discard** – delete the draft
+3. It publishes the listing directly and sends you the URL with all fields. If it cannot
+   recognize the item, it asks you instead (reply with brand, model, condition).
+4. With the Vinted mirror on, it then puts the same item on Vinted and reports the result.
 
 ### Daily listing check
 
@@ -174,6 +179,9 @@ ad_defaults:
 | `/discogssync` | Sync your Discogs inventory to Kleinanzeigen |
 | `/diagnose` | Browser diagnostics (troubleshooting) |
 | `/logs` | Show the last lines of the kleinanzeigen-bot log |
+| `/vinted` | Vinted mirror status: counts, open drafts, errors |
+| `/vintedsync` | Run the Vinted sync now |
+| `/vintedlogin <cookie>` | Connect the Vinted session (see [docs/vinted.md](docs/vinted.md)) |
 
 ### Discogs sync
 
@@ -204,7 +212,7 @@ Models are mapped per task in [`config/models.py`](config/models.py) and are eas
 ### Database
 
 A SQLite database at `DATABASE_PATH` (default `./data/bot.db`) stores drafts, a cache of active
-listings, per-draft photo IDs, and Discogs listing mappings.
+listings, per-draft photo IDs, Discogs listing mappings and Kleinanzeigen ↔ Vinted mappings.
 
 ## Development
 
@@ -230,9 +238,9 @@ kleinanzeigen-telegram-bot/
 ├── config/                  # settings.py (pydantic), models.py (OpenRouter mapping)
 ├── db/                      # SQLite layer (aiosqlite)
 ├── models/                  # Pydantic data models
-├── services/                # kleinanzeigen CLI wrapper, OpenRouter, Discogs, scheduler
+├── services/                # kleinanzeigen CLI wrapper, Vinted client/mapper/sync, OpenRouter, Discogs, scheduler
 ├── tests/                   # unit tests
-├── docs/diagrams/           # architecture diagrams (Mermaid)
+├── docs/                    # vinted.md (Vinted mirror), diagrams/ (Mermaid)
 └── kleinanzeigen-config/    # kleinanzeigen-bot config (config.yaml is gitignored)
     └── config.example.yaml
 ```

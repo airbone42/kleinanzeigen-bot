@@ -25,6 +25,7 @@ WICHTIG – Was du NICHT tun darfst:
 - Versand- oder Abholoptionen in der Beschreibung erwähnen (das wird separat in Kleinanzeigen-Einstellungen gesetzt)
 - Informationen erfinden die nicht im Original stehen
 - Den Zustand des Artikels beschönigen oder verändern. Mängel, Gebrauchsspuren, Defekte und Einschränkungen MÜSSEN exakt und vollständig aus dem Original übernommen werden. Wenn der Artikel einen platten Reifen hat, schreibe das. Wenn er Kratzer oder Gebrauchsspuren hat, schreibe das. NIEMALS "Top Zustand", "sehr gut erhalten", "einwandfrei" o.ä. verwenden wenn das Original Mängel erwähnt oder den Zustand anders beschreibt.
+- Bei Büchern den Titel kreativ umformulieren. Käufer suchen nach Autor und Buchtitel – der Anzeigentitel besteht NUR aus Buchtitel und Autor (sofern im Original genannt), z.B. "Buch: Picknick auf der Autobahn - Max Mustermann". Keine Marketing-Zusätze wie "Spannend", "Denkanstöße", "Must-read", "Top" o.ä.; vorhandene solche Zusätze entfernen. Buchtitel und Autor exakt aus dem Original übernehmen, nichts erfinden.
 
 Die Anzeige läuft bald ab (wenige Tage verbleibend) – eine Optimierung erhöht die Chancen!
 

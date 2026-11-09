@@ -47,6 +47,28 @@ def setup_scheduler(app: Application) -> AsyncIOScheduler:
         misfire_grace_time=7200,  # Allow 2 hour grace for missed jobs (covers DST transitions)
     )
 
+    vinted_hours = settings.get_vinted_sync_hours()
+    if settings.vinted_enabled and vinted_hours:
+
+        async def _run_vinted_sync() -> None:
+            from bot.handlers.vinted import scheduled_vinted_sync
+            from telegram.ext import CallbackContext
+
+            await scheduled_vinted_sync(CallbackContext(app))  # type: ignore[arg-type]
+
+        scheduler.add_job(
+            _run_vinted_sync,
+            trigger=CronTrigger(
+                hour=",".join(str(h) for h in vinted_hours), minute=30, timezone="Europe/Berlin"
+            ),
+            id="vinted_sync",
+            name="Vinted sold/removed sync",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        logger.info(f"Scheduler configured: Vinted sync at {vinted_hours} :30 (Europe/Berlin)")
+
     logger.info(
         f"Scheduler configured: daily check at "
         f"{settings.daily_check_hour:02d}:{settings.daily_check_minute:02d} (Europe/Berlin)"

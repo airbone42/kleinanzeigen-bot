@@ -2,7 +2,7 @@
 
 OPENROUTER_MODELS: dict[str, str] = {
     # Unified model choice for all tasks (cost-optimized baseline)
-    "image_analysis": "google/gemini-2.5-flash-lite",
+    "image_analysis": "google/gemini-2.5-flash",
     "text_generation": "google/gemini-2.5-flash-lite",
     "price_estimation": "google/gemini-2.5-flash-lite",
     "optimization": "google/gemini-2.5-flash-lite",
